@@ -45,6 +45,8 @@ import confidence as _confidence
 import multimodal as _mm
 # 借鉴 GEOFlow 质量门禁：答案质检走 JSON Schema 硬约束
 import schema_qc as _qc
+# D20（GEOFlow 升级③）：召回前元数据过滤（时效 effective_date + 审核态 review_status）
+import meta_filter as _mf
 
 # ---------------------------------------------------------------- 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -125,6 +127,9 @@ def ingest_documents(docs, namespace="default", kb_path=None, chunk_mode="semant
 
     D13：新增 chunk_mode（semantic | legacy | proposition | template），
     默认语义分块；doc 里也可带 `modality`/`meta` 字段走 D17 跨模态入库。
+    D20：doc 可带治理字段 `effective_date`（生效日期）/ `effective_until`
+    （失效日期）/ `review_status`（审核状态），会下沉到每块的 meta，
+    供召回前过滤（meta_filter）判定时效与审核态。
     """
     if kb_path is None:
         kb_path = _kb_path(namespace)
@@ -150,6 +155,10 @@ def ingest_documents(docs, namespace="default", kb_path=None, chunk_mode="semant
         # D17：doc 可带 modality/meta（table / image），此时 text 已是渲染好的检索文本
         modality = doc.get("modality", "text")
         meta = doc.get("meta") or {}
+        # D20：doc 顶层治理字段下沉到 meta（doc.meta 里写了的同名键优先，不覆盖）
+        for k in ("effective_date", "effective_until", "expires_at", "review_status"):
+            if doc.get(k) and not meta.get(k):
+                meta[k] = doc[k]
         for i, ch in enumerate(chunk_text(text, mode=chunk_mode)):
             cid = "{0}_{1}".format(doc_id, i)
             if cid in seen:
@@ -207,9 +216,37 @@ def load_kb(namespace="default", kb_path=None):
 def kb_stats(namespace="default"):
     rows = load_kb(namespace)
     if not rows:
-        return {"rows": 0, "chunks": 0, "docs": []}
+        return {"rows": 0, "chunks": 0, "docs": [], "meta": _mf.filter_stats([])}
     docs = sorted({r["filename"] for r in rows})
-    return {"rows": len(rows), "chunks": len(rows), "docs": docs, "namespace": namespace}
+    # D20：治理健康度——过期/未生效/未审核/作废各拦了多少
+    return {"rows": len(rows), "chunks": len(rows), "docs": docs,
+            "namespace": namespace, "meta": _mf.filter_stats(rows)}
+
+
+# -------------------------------------------- D20：召回前元数据过滤（治理门禁）
+# 最近一次检索的过滤统计（可观测：拦了几块、各什么原因），prepare_ask 透出给前端
+_LAST_META_FILTER = {"hidden": 0, "reasons": []}
+
+
+def _filter_rows(rows):
+    """D20 统一过滤入口：过期/未生效/未审核/作废的块【连候选都不进】。
+
+    返回可见块列表；过滤统计记入 _LAST_META_FILTER，供 answer 响应透出。
+    GEOFlow 的核心思想：治理规则必须发生在代码层，不能指望 prompt 叮嘱 LLM。
+    """
+    global _LAST_META_FILTER
+    visible, blocked = _mf.visible_rows(rows)
+    _LAST_META_FILTER = {
+        "hidden": len(blocked),
+        "reasons": [{"chunk_id": r.get("chunk_id", ""), "title": r.get("title", ""),
+                     "state": st, "reason": why}
+                    for r, st, why in blocked[:10]],  # 最多透出 10 条，防响应膨胀
+    }
+    return visible
+
+
+def last_meta_filter():
+    return dict(_LAST_META_FILTER)
 
 
 # -------------------------------------------- 检索：embedding 主，TF-IDF 兜底 --
@@ -319,8 +356,14 @@ def retrieve_candidates(query, top_k=DEFAULT_TOP_K, namespace="default",
     语义检索擅长「意思相近但用词不同」，TF-IDF 擅长「精确关键词命中」。
     两路都只取 top_k 容易漏掉对方高 relevant 的结果，所以先各取宽一些，
     再在 rerank_fusion 里对齐排序。
+
+    D20：两路召回共用同一个可见块集合——过期/未审核的块在【进入检索之前】
+    就被 _filter_rows 挡掉，语义索引与 TF-IDF 天然看不到它们。
     """
     rows = load_kb(namespace, kb_path)
+    if not rows:
+        return [], []
+    rows = _filter_rows(rows)
     if not rows:
         return [], []
     backend, index = _ensure_index(rows, namespace)
@@ -593,6 +636,8 @@ def prepare_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
         "from_cache": False,
         "retrieval": retrieval,
         "namespace": namespace,
+        # D20：治理可观测——本次检索拦了哪些过期/未审核块
+        "meta_filtered": _LAST_META_FILTER,
     }
 
 
@@ -607,6 +652,8 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     D15：use_cache=True 时相同问题命中缓存，不重复检索+调模型。
     D16：额外输出 confidence / confidence_level / confidence_reason。
     D17：modalities 可限定只检索 text/table/image 中的某几种模态。
+    D20：召回前元数据过滤——过期/未生效/未审核/作废的块不进检索，
+         响应里带 meta_filtered 说明拦了什么（治理可观测）。
     """
     prepared = prepare_ask(
         question, top_k=top_k, namespace=namespace, history=history,
@@ -615,6 +662,7 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     if prepared["from_cache"]:
         out = dict(prepared)
         out.setdefault("from_cache", True)
+        out.setdefault("meta_filtered", _LAST_META_FILTER)
         if verbose:
             print("📦 命中缓存，跳过检索与调模型：" + question)
         return out
@@ -681,6 +729,9 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
             print("🔄 改写后检索问句：" + prepared["effective_question"])
         print("🔍 命中 {0} 块（后端：{1}｜模式：{2}）".format(
             prepared["hits"], prepared["backend"], retrieval))
+        mf = prepared.get("meta_filtered") or {}
+        if mf.get("hidden"):
+            print("🛡 治理过滤：{0} 块过期/未生效/未审核/作废，召回前已拦截".format(mf["hidden"]))
         for s in prepared["sources"]:
             print("  [{0}] {1}（{2}｜{3}）".format(
                 s["n"], s["title"], s["filename"], s["score"]))

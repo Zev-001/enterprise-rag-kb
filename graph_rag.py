@@ -72,11 +72,17 @@ def _get_graph(namespace):
 
 
 def retrieve_graph(query, namespace="default", top_k=rc.DEFAULT_TOP_K):
-    """多跳检索，返回 [(score, chunk)]，score 归一化到 [0,1]。"""
+    """多跳检索，返回 [(score, chunk)]，score 归一化到 [0,1]。
+
+    D20：过期/未审核的块同样不进图谱检索——实体图仍全量建（关系完整），
+    但打分与出结果都按「可见块集合」收口，治理口径与普通检索一致。
+    """
     entity2chunks, cooccur = _get_graph(namespace)
     rows = rc.load_kb(namespace)
+    rows = rc._filter_rows(rows)  # D20：治理过滤（过期/未生效/未审核/作废）
     if not rows:
         return []
+    visible_ids = {r["chunk_id"] for r in rows}
     q_ents = extract_entities(query)
     # 候选块打分
     score = defaultdict(float)
@@ -87,7 +93,8 @@ def retrieve_graph(query, namespace="default", top_k=rc.DEFAULT_TOP_K):
             if e in entity2chunks:
                 seen_entities.add(e)
                 for cid in entity2chunks[e]:
-                    score[cid] += 1.0
+                    if cid in visible_ids:
+                        score[cid] += 1.0
         # 第 1 跳：沿共现边扩散到邻居实体，继承部分权重
         neighbors = set()
         for e in q_ents:
@@ -100,7 +107,8 @@ def retrieve_graph(query, namespace="default", top_k=rc.DEFAULT_TOP_K):
             if nb in entity2chunks:
                 seen_entities.add(nb)
                 for cid in entity2chunks[nb]:
-                    score[cid] += 0.5
+                    if cid in visible_ids:
+                        score[cid] += 0.5
     else:
         # 没抽到实体：退回关键词重叠，保证有结果
         toks = set(rc._TfidfIndex._tok(query))

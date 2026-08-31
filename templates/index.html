@@ -251,7 +251,12 @@
       try {
         const r = await fetch("/api/stats" + tokenParam());
         const d = await r.json();
-        kbStatus.textContent = "知识库：" + d.docs.length + " 份文档 · " + d.chunks + " 个知识块";
+        let metaBits = "知识库：" + d.docs.length + " 份文档 · " + d.chunks + " 个知识块";
+        // D20 治理健康度：过期/未审核块被拦在检索之外
+        if (d.meta && d.meta.hidden > 0) {
+          metaBits += " · 🛡 已拦截 " + d.meta.hidden + " 块（过期/未审核不参与检索）";
+        }
+        kbStatus.textContent = metaBits;
         if (d.docs.length === 0) {
           docList.innerHTML = "<li class='empty'>暂无文档</li>";
         } else {

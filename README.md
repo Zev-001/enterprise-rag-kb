@@ -52,6 +52,7 @@
 | 跨模态 | `multimodal.py` | **P2 补强**：表格/图片(OCR) 结构化入库，统一走一套检索（D17） |
 | 答案质检 | `schema_qc.py` | **对标 GEOFlow 质量门禁**：答案质检强制 JSON Schema 输出 + 证据编号回验，替代拒答正则（详见下节） |
 | 引用内容回验 | `evidence_verify.py` | **对标 GEOFlow validateEvidenceSnapshot**：拿引用块全文校验每条断言，抓「张冠李戴」型引用幻觉，只降不升（D19，详见下节） |
+| 召回前元数据过滤 | `meta_filter.py` | **对标 GEOFlow 知识治理**：生效日期(effective_date) 时效 + 审核状态(review_status) 治理——过期/未生效/未审核/作废的块在【进入检索之前】就被拦掉，不靠 prompt 叮嘱（D20，详见下节） |
 
 **技术选型理由（面试常问）**
 - `sentence-transformers` 的 `bge-small-zh-v1.5`：中文语义检索效果好的轻量模型，本地跑不联网也能检索。
@@ -310,6 +311,32 @@ D18 的编号越界校验抓不到这种幻觉：答案说「年假有 5 天 [2]
 回归：`test_evidence_verify.py` 33 项（含真实语义路径）、P2 自测 35/35、D18 自测 41/41、
 eval 检索层 100 分。开关：`RAG_EVIDENCE_VERIFY=off` 关闭（默认 on，异常自动跳过不伤主流程）。
 
+### 召回前元数据过滤：过期/未审核的块连候选都不进（借鉴 GEOFlow 知识治理，2026-08-31）
+
+D19 及之前的质检都在「答案已经生成之后」兜底。GEOFlow 给的另一个启发是**治理前移**：
+企业知识库不是「进了库就能用」——明年才生效的薪级表、上个月已作废的报销标准、
+还没定稿的草稿，检索得再准也不该拿来回答今天的提问。`meta_filter.py`（D20）把这道门
+挪到**召回之前**：
+
+1. **代码层硬过滤，不靠 prompt 叮嘱**：块带 `effective_date`（生效日期）/
+   `effective_until`/`expires_at`（失效日期）/ `review_status`（审核状态）元数据时，
+   未生效/已过期/草稿/待审核/已作废的块在进入语义索引与 TF-IDF **之前**就被剔除——
+   两路召回天然看不到它们，GraphRAG 检索同样按可见块集合收口；
+2. **向后兼容**：不写治理字段的块（老库）行为完全不变；`review_status` 写了但值不认识
+   → 保守当未审核拦下（fail-closed，治理场景宁可误拦）；
+3. **边界语义**：当天生效算生效、当天到期仍可用（含边界），日期支持
+   `2026-08-31` / `2026/8/31` / `2026年8月31日` / `20260831` 等多格式；
+4. **治理可观测**：过滤不搞黑箱——`/api/stats` 返回库里拦了多少块（前端知识库状态栏
+   显示「🛡 已拦截 N 块」），每次问答响应带 `meta_filtered`（拦了哪些块、各什么原因），
+   CLI/日志同步打印；全被拦时检索为空，交给防幻觉闸门走「资料里没提到」；
+5. **入库即声明**：上传文档时可带治理字段（`{"filename":..., "effective_date":"2026-09-01",
+   "review_status":"draft"}`），自动下沉到每块 meta。
+
+开关：`RAG_META_FILTER=off` 退回不过滤（对照评测）；`RAG_TODAY=2026-08-31` 可指定
+「今天」（时间旅行演示：同一份库，把今天拨到生效日之后，被拦的块立刻可见）。
+自测：`test_meta_filter.py` 43 项全过（离线零依赖）；P2 35/35、D18 41/41、
+D19 30/30、eval 100 分无回归。
+
 **启用鉴权**
 ```bash
 # 设环境变量指定 admin token（不设则首次运行自动生成并写入 acl.json）
@@ -326,6 +353,6 @@ $PY app.py
 - ⚠️ 当前 ACL 是「应用层 token + namespace 白名单」，企业级应**镜像源系统 ACL**（Glean / M365 Purview 那种），数据模型已留扩展位（namespace 即隔离边界）。
 - ⚠️ OCR 需另装 `pytesseract` + 系统 `Tesseract` + `poppler`，未装时扫描件仅提示、不阻断入库。
 - ⚠️ 大文件（>50MB PDF）解析较慢，可加「后台任务 + 进度条」。
-- ✅ **额外补强**：答案质检改 JSON Schema 硬约束（`schema_qc.py`），借鉴 GEOFlow 质量门禁——替代拒答正则、抓引用幻觉、给出资料缺口。
-- 💡 **下一步可做**：把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现；知识库加时效(`effective_date`)/审核状态并在召回前过滤（GEOFlow 同款）；引用块加 `content_hash` 发布时回验。
+- ✅ **额外补强**：答案质检改 JSON Schema 硬约束（`schema_qc.py`）+ 引用内容级回验（`evidence_verify.py`）+ 召回前元数据过滤（`meta_filter.py`），三件套借鉴 GEOFlow 质量门禁/知识治理——替代拒答正则、抓引用幻觉、过期/未审核资料进不了检索。
+- 💡 **下一步可做**：把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现；内容指纹（内容+prompt+知识 hash）缓存 key，知识变了缓存自动失效（`content_hash` 已就位）；引用块加 `content_hash` 发布时回验。
 - 💡 可接 day22 的 `xhs-cover-gen` 思路，把「知识库问答」包装成可被外部调用的服务。

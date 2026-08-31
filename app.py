@@ -175,6 +175,8 @@ def ask():
         # D14 上下文压缩 / D15 缓存
         "compress": out.get("compress"),
         "from_cache": bool(out.get("from_cache")),
+        # D20 治理可观测：本次召回前拦了哪些过期/未审核块
+        "meta_filtered": out.get("meta_filtered") or rc.last_meta_filter(),
     })
 
 
@@ -308,6 +310,7 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
             "qc_action": out.get("qc_action", "warn"),
             "compress": out.get("compress"),
             "from_cache": bool(out.get("from_cache")),
+            "meta_filtered": out.get("meta_filtered") or rc.last_meta_filter(),
         })
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream")
@@ -425,6 +428,8 @@ def stats():
         "docs": st["docs"],
         "chunks": st["chunks"],
         "namespace": namespace,
+        # D20 治理健康度：库里有多少块被时效/审核规则拦在检索之外
+        "meta": st.get("meta") or {"total": st["chunks"], "hidden": 0},
     })
 
 
