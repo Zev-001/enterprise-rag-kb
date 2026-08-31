@@ -34,6 +34,11 @@ body {
   font-size: 13px; color: var(--brand);
   background: var(--brand-soft); padding: 6px 12px; border-radius: 20px;
 }
+.token-input {
+  width: 230px; padding: 7px 10px; font-size: 12px;
+  border: 1px solid var(--border); border-radius: 20px; outline: none;
+}
+.token-input:focus { border-color: var(--brand); }
 
 .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
 @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }

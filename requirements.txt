@@ -5,3 +5,15 @@ numpy>=1.24
 pdfplumber>=3.0
 python-docx>=1.1
 requests>=2.31
+
+# ---- 可选（D3 扫描件 OCR，不装也不影响文字层 PDF / 表格抽取）----
+# pytesseract>=0.3
+# pdf2image>=1.17
+# Pillow>=10.0
+# 注：pytesseract 还需系统装 Tesseract OCR 引擎 + poppler（Windows 用 scoop/apt 安装）
+
+# ---- 可选（P1 连接器 WebPageConnector 的网页正文解析，不装则走正则兜底）----
+# beautifulsoup4>=4.12
+
+# ---- 可选（P1 图谱若想用现成图库而非内置纯 dict 实现时）----
+# networkx>=3.0

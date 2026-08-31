@@ -43,8 +43,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KB_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(KB_DIR, exist_ok=True)
 
-API_URL = "https://api.deepseek.com/v1/chat/completions"
-MODEL = "deepseek-chat"
+# D4 补强（P0）：模型可配置，迈出「模型路由」第一步。
+#   默认 DeepSeek；想换模型/厂商，只需设环境变量，不必改代码：
+#     RAG_LLM_API_URL  自定义 chat/completions 端点（OpenAI / 通义 / 本地 vLLM 都兼容）
+#     RAG_LLM_MODEL    自定义模型名（如 gpt-4o-mini / qwen-plus / 本地模型名）
+API_URL = os.environ.get("RAG_LLM_API_URL", "https://api.deepseek.com/v1/chat/completions")
+MODEL = os.environ.get("RAG_LLM_MODEL", "deepseek-chat")
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
 
@@ -168,6 +172,17 @@ def ingest_documents(docs, namespace="default", kb_path=None):
     with open(kb_path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # P1：知识库变了 → 让向量库索引 / 图谱缓存失效，下次查询自动重建（不读到旧数据）
+    try:
+        import vector_store as vs
+        vs.drop(namespace)
+    except Exception:
+        pass
+    try:
+        import graph_rag as gr
+        gr.clear_cache(namespace)
+    except Exception:
+        pass
     return added
 
 
@@ -198,9 +213,20 @@ def kb_stats(namespace="default"):
 
 
 # -------------------------------------------- 检索：embedding 主，TF-IDF 兜底 --
-def _build_index(chunks):
+def _build_index(chunks, namespace="default", chunk_ids=None):
     if os.environ.get("RAG_BACKEND") == "tfidf":
         return "tfidf", _TfidfIndex(chunks)
+    # D12 补强（P1）：优先用持久化向量库（落盘索引，免每次重建）
+    try:
+        import vector_store as vs
+        if chunk_ids is None:
+            chunk_ids = [str(i) for i in range(len(chunks))]
+        res = vs.build_or_load(namespace, chunks, chunk_ids)
+        if res:
+            return res
+    except Exception:
+        pass
+    # 回落：内存重建（保持原行为，确保缺依赖也能跑）
     try:
         from sentence_transformers import SentenceTransformer
         import numpy as np
@@ -270,49 +296,91 @@ _INDEX_OBJ = None
 _BACKEND = None
 
 
-def _ensure_index(rows):
+def _ensure_index(rows, namespace="default"):
     global _INDEX_KEY, _INDEX_OBJ, _BACKEND
-    key = tuple(r["chunk_id"] for r in rows)
+    key = (namespace, tuple(r["chunk_id"] for r in rows))
     if not rows:
         return "tfidf", _TfidfIndex([])
     if _INDEX_KEY == key and _INDEX_OBJ is not None:
         return _BACKEND, _INDEX_OBJ
-    backend, index = _build_index([r["text"] for r in rows])
+    backend, index = _build_index([r["text"] for r in rows], namespace,
+                                  [r["chunk_id"] for r in rows])
     _INDEX_KEY = key
     _INDEX_OBJ = index
     _BACKEND = backend
     return backend, index
 
 
-def retrieve(query, top_k=DEFAULT_TOP_K, namespace="default", kb_path=None):
-    """返回 [(块 dict, 得分)]。"""
+# -------------------------------------------- D2 补强（P0）：RRF 融合重排
+def retrieve_candidates(query, top_k=DEFAULT_TOP_K, namespace="default",
+                        kb_path=None, candidate_factor=3):
+    """两路各多召回候选（top_k*candidate_factor），交给融合重排。
+
+    语义检索擅长「意思相近但用词不同」，TF-IDF 擅长「精确关键词命中」。
+    两路都只取 top_k 容易漏掉对方高 relevant 的结果，所以先各取宽一些，
+    再在 rerank_fusion 里对齐排序。
+    """
     rows = load_kb(namespace, kb_path)
     if not rows:
-        return []
-    backend, index = _ensure_index(rows)
+        return [], []
+    backend, index = _ensure_index(rows, namespace)
+    sem_pairs = []
     if backend == "semantic":
         try:
             model, faiss_index = index
             import numpy as np
             vecs = model.encode([query], normalize_embeddings=True,
                                 show_progress_bar=False, convert_to_numpy=True).astype("float32")
-            d, idxs = faiss_index.search(vecs, top_k)
-            pairs = []
+            cand = max(top_k * candidate_factor, 8)
+            d, idxs = faiss_index.search(vecs, cand)
             for s, i in zip(d[0], idxs[0]):
-                if i < 0 or i >= len(rows):
+                if i < 0 or i >= len(rows) or s <= 0:
                     continue
-                if s <= 0:
-                    continue
-                pairs.append((float(s), rows[i]))
-            pairs.sort(key=lambda x: x[0], reverse=True)
-            return pairs
+                sem_pairs.append((float(s), rows[i]))
+            sem_pairs.sort(key=lambda x: x[0], reverse=True)
         except Exception:
-            pass
-    idx = _TfidfIndex([r["text"] for r in rows])
-    out = []
-    for s, i in idx.query(query, top_k):
-        out.append((s, rows[i]))
-    return out
+            sem_pairs = []
+    tfidf_idx = _TfidfIndex([r["text"] for r in rows])
+    tfidf_pairs = [(s, rows[i]) for s, i in tfidf_idx.query(query, max(top_k * candidate_factor, 8))]
+    return sem_pairs, tfidf_pairs
+
+
+def rerank_fusion(sem_pairs, tfidf_pairs, top_k=DEFAULT_TOP_K, k=60):
+    """RRF（Reciprocal Rank Fusion）跨两路召回做重排。
+
+    高端系统用 cross-encoder 重排（如 bge-reranker）；我们离线优先用 RRF——
+    不引新模型、不烧算力，就能把「语义相关但关键词弱」和「关键词命中但语义偏」
+    两类结果对齐排序，比单路直接取 top_k 精度更高。后续接 bge-reranker 时
+    只需替换此函数（接口不变：喂两路候选，吐排好序的 top_k）。
+
+    关键：融合分只用于「排序」，最终返回的得分仍用「原始最高相似度」
+    （语义/关键词两路里较大的那个）。这样 grounded_ask 里的
+    RELEVANCE_THRESHOLD 守门照常生效——不会因重排把一堆噪声块当命中，
+    否则防幻觉闸门会被稀释（这是加 rerank 时最容易踩的坑，已在此规避）。
+    """
+    fused = {}
+    for pairs in (sem_pairs, tfidf_pairs):
+        for rank, (s, r) in enumerate(pairs, 1):
+            cid = r["chunk_id"]
+            entry = fused.setdefault(cid, [0.0, 0.0, r])  # [rrf分, 原始最高相似度, 块]
+            entry[0] += 1.0 / (k + rank)
+            entry[1] = max(entry[1], s)
+    ranked = sorted(fused.values(), key=lambda x: -x[0])
+    return [(sc, r) for _, sc, r in ranked[:top_k]]
+
+
+def retrieve(query, top_k=DEFAULT_TOP_K, namespace="default", kb_path=None,
+             rerank=True, candidate_factor=3):
+    """返回 [(块 dict, 得分)]，默认经 RRF 融合重排（D2 补强）。
+
+    设 rerank=False 可退回「单路直接取 top_k」的旧行为，方便对照评测。
+    """
+    sem_pairs, tfidf_pairs = retrieve_candidates(
+        query, top_k=top_k, namespace=namespace, kb_path=kb_path,
+        candidate_factor=candidate_factor)
+    if rerank and (sem_pairs or tfidf_pairs):
+        return rerank_fusion(sem_pairs, tfidf_pairs, top_k=top_k)
+    return sem_pairs or tfidf_pairs
 
 
 # ------------------------------------------------ 防幻觉 prompt
@@ -348,17 +416,21 @@ def _build_context(pairs, cap_chars=1200):
     return "\n".join(out)
 
 
-def ask_llm(prompt, temperature=0.3):
+def ask_llm_raw(system, user, temperature=0.3):
+    """底层 LLM 调用，system/user 都可自定义（D8 Agentic / D10 改写复用）。"""
     key = _key()
     if not key:
         raise ValueError("DEEPSEEK_API_KEY 未设置，无法调大模型。")
+    # D4 补强：每次调用时实时读环境变量，支持运行时切换模型/端点（模型路由）
+    api_url = os.environ.get("RAG_LLM_API_URL", API_URL)
+    model = os.environ.get("RAG_LLM_MODEL", MODEL)
     resp = requests.post(
-        API_URL,
+        api_url,
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
         json={
-            "model": MODEL,
-            "messages": [{"role": "system", "content": SYSTEM_GROUND},
-                         {"role": "user", "content": prompt}],
+            "model": model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
             "temperature": temperature,
             "max_tokens": 700,
         },
@@ -368,13 +440,66 @@ def ask_llm(prompt, temperature=0.3):
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def ask_llm(prompt, temperature=0.3):
+    """默认用防幻觉 system 提示作答。"""
+    return ask_llm_raw(SYSTEM_GROUND, prompt, temperature=temperature)
+
+
+def rewrite_query(question, history):
+    """D10 补强（P1）：把追问改写成可独立检索的完备问题。
+
+    history = [{"q":..., "a":...}, ...]。高端系统都做这一步，否则「那加班餐补呢」
+    这种承接上一轮的问题检索不到任何东西。
+      - 含指代代词 / 过短 → 用上一轮问题补全
+      - 在线时让 LLM 改写成独立问题；离线（RAG_TEST）直接拼接上一轮问题
+    """
+    if not history:
+        return question
+    last = history[-1]
+    last_q = (last.get("q") or "").strip()
+    last_a = (last.get("a") or "").strip()
+    # 仅在「明显承接上一轮」时改写：含指代代词（它/这个/前者…）或追问词（为什么）。
+    # 不含这些的完整问题（如「报销上限多少」）保持原样，避免画蛇添足反而干扰检索。
+    pronouns = ("它", "他", "她", "这个", "那个", "这些", "那些", "前者", "后者",
+                "上面", "前面", "上述", "这", "那", "为什么")
+    if any(p in question for p in pronouns):
+        combined = (last_q + " " + question).strip() if last_q else question
+        if os.environ.get("RAG_TEST") == "1":
+            return combined
+        try:
+            sys_p = ("你是查询改写助手。用户正在多轮追问，请把本轮问题改写成一个"
+                     "脱离上下文也能独立检索的完整问题。只输出改写后的问题，不要解释。")
+            user_p = "上一轮问题：{0}\n上一轮回答：{1}\n本轮追问：{2}".format(
+                last_q, last_a, question)
+            rewritten = ask_llm_raw(sys_p, user_p, temperature=0.1).strip()
+            return rewritten or combined
+        except Exception:
+            return combined
+    return question
+
+
 def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
-                 verbose=True, return_sources=True):
-    """检索 → 提示 → 大模型回答。返回 dict，含 answer 与 sources(可点击溯源)。"""
-    pairs = retrieve(question, top_k=top_k, namespace=namespace)
+                 verbose=True, return_sources=True, history=None,
+                 retrieval="default"):
+    """检索 → 提示 → 大模型回答。返回 dict，含 answer 与 sources(可点击溯源)。
+
+    D10：传 history（多轮历史）会自动改写追问，让承接上一轮的问题也能检索到。
+    D7 ：retrieval="graph" 走 GraphRAG 多跳检索（默认仍是语义+关键词融合）。
+    """
+    # D10：多轮改写
+    effective_q = rewrite_query(question, history) if history else question
+    # D7：检索模式
+    if retrieval == "graph":
+        try:
+            import graph_rag as gr
+            pairs = gr.retrieve_graph(effective_q, namespace=namespace, top_k=top_k)
+        except Exception:
+            pairs = retrieve(effective_q, top_k=top_k, namespace=namespace)
+    else:
+        pairs = retrieve(effective_q, top_k=top_k, namespace=namespace)
     pairs = [(s, r) for s, r in pairs if s >= RELEVANCE_THRESHOLD]
     ctx = _build_context(pairs)
-    prompt = USER_GROUND.format(question=question, ctx=ctx or "（没有检索到相关资料）")
+    prompt = USER_GROUND.format(question=effective_q, ctx=ctx or "（没有检索到相关资料）")
 
     sources = [
         {"n": i + 1, "filename": r.get("filename", ""), "title": r.get("title", ""),
@@ -388,11 +513,15 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
         answer = ask_llm(prompt)
 
     out = {"question": question, "answer": answer, "sources": sources,
-           "backend": _BACKEND or "tfidf", "hits": len(pairs)}
+           "backend": _BACKEND or "tfidf", "hits": len(pairs),
+           "effective_question": effective_q, "retrieval": retrieval}
     if verbose:
         print("=" * 70)
         print("❓ " + question)
-        print("🔍 命中 {0} 块（后端：{1}）".format(len(pairs), out["backend"]))
+        if effective_q != question:
+            print("🔄 改写后检索问句：" + effective_q)
+        print("🔍 命中 {0} 块（后端：{1}｜模式：{2}）".format(
+            len(pairs), out["backend"], retrieval))
         for s in sources:
             print("  [{0}] {1}（{2}｜{3}）".format(s["n"], s["title"], s["filename"], s["score"]))
         print("💬 " + answer)

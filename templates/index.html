@@ -17,6 +17,8 @@
         </div>
       </div>
       <div class="kb-status" id="kbStatus">知识库：加载中…</div>
+      <input type="password" id="apiToken" class="token-input"
+             placeholder="访问令牌 token（见 acl.json 的 admin）" />
     </header>
 
     <main class="layout">
@@ -73,6 +75,13 @@
     const composer = $("#composer");
     const question = $("#question");
     const sendBtn = $("#sendBtn");
+    const apiToken = $("#apiToken");
+
+    // 把 token 拼到 URL（D1+D5：所有 API 必须带 token）
+    function tokenParam() {
+      const t = (apiToken.value || "").trim();
+      return t ? ("?token=" + encodeURIComponent(t)) : "";
+    }
 
     function escapeHtml(s) {
       return (s || "").replace(/[&<>"']/g, (c) => ({
@@ -124,7 +133,7 @@
     // 拉取知识库状态
     async function refreshStats() {
       try {
-        const r = await fetch("/api/stats");
+        const r = await fetch("/api/stats" + tokenParam());
         const d = await r.json();
         kbStatus.textContent = "知识库：" + d.docs.length + " 份文档 · " + d.chunks + " 个知识块";
         if (d.docs.length === 0) {
@@ -144,7 +153,7 @@
       const fd = new FormData();
       for (const f of fileList) fd.append("files", f);
       try {
-        const r = await fetch("/api/upload", { method: "POST", body: fd });
+        const r = await fetch("/api/upload" + tokenParam(), { method: "POST", body: fd });
         const d = await r.json();
         if (d.ok) {
           const ok = d.results.filter((x) => x.ok).length;
@@ -177,7 +186,7 @@
       addThinking();
       sendBtn.disabled = true;
       try {
-        const r = await fetch("/api/ask", {
+        const r = await fetch("/api/ask" + tokenParam(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ question: q }),

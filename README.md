@@ -37,6 +37,14 @@
 | Web 应用 | `app.py` | Flask 接口：上传、问答、统计；托管前端页面 |
 | 前端页面 | `templates/index.html` + `static/style.css` | 聊天式界面：上传区 + 对话区 + 引用卡片 |
 | 演示入库 | `demo_ingest.py` | 把示例资料喂进知识库，方便一上来就有东西可问 |
+| 鉴权 / ACL | `auth.py` | **P0 补强**：token 鉴权 + 知识库 namespace 权限隔离（D1/D5） |
+| 量化评测 | `eval_rag.py` | **P0 补强**：内置中文问答金标准集，离线验检索召回率与可分性（D6） |
+| 会话存储 | `session_store.py` | **P1 补强**：文件级多轮会话（重启不丢，TTL 清理），支撑查询改写（D10） |
+| LLMOps 日志 | `rag_log.py` | **P1 补强**：问答落 JSONL + 指标聚合（延迟/拒答率/Top 问题）（D11） |
+| 持久化向量库 | `vector_store.py` | **P1 补强**：FAISS 索引落盘 + 签名校验，免每次重建（D12） |
+| GraphRAG | `graph_rag.py` | **P1 补强**：实体抽取 + 轻量图谱多跳检索，`retrieval=graph` 启用（D7） |
+| Agentic RAG | `agentic_rag.py` | **P1 补强**：ReAct 式自问自答，`mode=agent` 启用（D8） |
+| 企业连接器 | `connectors.py` | **P1 补强**：Connector 基类 + 本地目录 / 网页连接器（D9） |
 
 **技术选型理由（面试常问）**
 - `sentence-transformers` 的 `bge-small-zh-v1.5`：中文语义检索效果好的轻量模型，本地跑不联网也能检索。
@@ -138,9 +146,72 @@ enterprise_rag/
 
 ---
 
-## 七、已知边界 / 下一步可扩展
+## 七、P0 补强记录（对标高端系统的差距收敛）
 
-- ⚠️ 当前是单知识库 `default`，多租户隔离（不同公司互不看到）可在 `rag_core.load_kb(kb)` 的 `kb` 参数上扩展。
+> 依据 `RAG调研与缺陷分析.md` 的缺陷清单，本轮补齐了 6 项 P0（D1–D6）。
+
+| 缺陷 | 内容 | 本轮补强 | 文件 |
+|------|------|----------|------|
+| D2 无 Rerank | 单路取 top_k，易漏相关块 | RRF 跨「语义+关键词」两路融合重排；**保留原始相似度做阈值守门**，避免稀释防幻觉闸门 | `rag_core.py` `rerank_fusion` |
+| D3 文档解析 | 仅读 PDF 文字层，表格/扫描件丢失 | `pdfplumber` **表格抽取**单列成块；扫描件无文字层时优雅尝试 OCR（pytesseract 可选，缺依赖不中断） | `ingest_docs.py` |
+| D4 单 LLM 硬编码 | 只能 deepseek-chat | `MODEL` / `API_URL` 改读环境变量（`RAG_LLM_MODEL` / `RAG_LLM_API_URL`），可切任意 OpenAI 兼容端点（模型路由第一步） | `rag_core.py` |
+| D1 无 ACL / D5 无鉴权 | 谁都能访问任意知识库 | `auth.py`：token 鉴权 + namespace 白名单；admin token 落 `acl.json` 持久化；前端加 token 输入框 | `auth.py` + `app.py` + `index.html` |
+| D6 无评测体系 | 改了不知变好变坏 | `eval_rag.py`：内置中文问答金标准集，离线验检索召回率 + 资料内/外可分性；`--live` 真机复验拒答话术 | `eval_rag.py` |
+
+### P1 补强（差异化能力，对标高端系统，2026-08-31）
+
+> 阶段 A（P0）收敛底线后，本轮补齐 6 项 P1（D7–D12）。实现原则：**零额外重依赖、可离线、等价对标**——用自研轻量 ReAct 替代 LangGraph、落盘 FAISS 替代 Qdrant，不引入 Docker / 外部服务即可讲高端故事。
+
+| 缺陷 | 内容 | 本轮补强 | 文件 |
+|------|------|----------|------|
+| D7 无 GraphRAG | 扁平 chunk 检索，答不了多跳/关系问题 | `graph_rag.py`：实体抽取 + 共现图谱（纯 dict 零依赖）；`/api/ask?retrieval=graph` 多跳检索 | `graph_rag.py` |
+| D8 无 Agentic RAG | 单趟检索，复杂问题遗漏 | `agentic_rag.py`：ReAct 自问自答（拆子问题→逐条检索作答→综合）；`/api/ask?mode=agent` | `agentic_rag.py` |
+| D9 无连接器 | 只能本地传文件 | `connectors.py`：基类 + `LocalFolderConnector` / `WebPageConnector`；`/api/connector/ingest`（admin）入库 | `connectors.py` |
+| D10 多轮上下文 | 每轮独立、不接上文 | `session_store.py` + `rewrite_query`：文件级会话 + 查询改写（指代消解）；`/api/ask` 带 `session_id` 连续追问 | `session_store.py` + `rag_core.py` |
+| D11 无 LLMOps | 上线黑盒、无日志 | `rag_log.py`：问答落 JSONL；`/api/metrics` 聚合（延迟/拒答率/Top 问题/按库分布） | `rag_log.py` |
+| D12 无生产向量库 | 内存索引、库大就慢 | `vector_store.py`：FAISS 落盘 + 签名校验，库不变免重建、变了自动失效 | `vector_store.py` |
+
+**P1 新增接口速查**
+```bash
+# 多轮连续追问（带 session_id 即承接上文）
+curl -X POST "http://127.0.0.1:5000/api/ask?token=$TK" -H 'Content-Type: application/json' \
+  -d '{"question":"那报销呢","namespace":"default","session_id":"上轮返回的sid"}'
+
+# GraphRAG 多跳检索
+curl -X POST ... -d '{"question":"年假怎么算","retrieval":"graph"}'
+
+# Agentic RAG 多步推理
+curl -X POST ... -d '{"question":"对比年假和调休政策","mode":"agent"}'
+
+# 从连接器拉数据入库（仅 admin）
+curl -X POST "http://127.0.0.1:5000/api/connector/ingest?token=$ADMIN" -H 'Content-Type: application/json' \
+  -d '{"type":"local_folder","source":"D:/docs","namespace":"team"}'
+
+# 看运维指标
+curl "http://127.0.0.1:5000/api/metrics?token=$TK"
+```
+
+**运行评测（不烧 token）**
+```bash
+$PY eval_rag.py            # 离线：检索召回率 + 可分性（默认 100% 召回）
+$PY eval_rag.py --live     # 真机：连「资料里没提到」拒答话术一起验（需 DEEPSEEK_API_KEY）
+```
+
+**启用鉴权**
+```bash
+# 设环境变量指定 admin token（不设则首次运行自动生成并写入 acl.json）
+export RAG_API_TOKEN=你的强口令
+$PY app.py
+# 网页右上角「访问令牌」框粘贴该 token；API 也可带 ?token= 或 Header Authorization: Bearer
+```
+
+---
+
+## 八、已知边界 / 下一步可扩展（P1 已收，剩 P2）
+
+- ✅ **P0 + P1 已收敛**：Rerank / 表格抽取 / 模型可配置 / 鉴权+ACL / 量化评测（P0），以及 GraphRAG / Agentic RAG / 连接器 / 多轮上下文 / LLMOps / 持久化向量库（P1）均已落地并实测。
+- ⚠️ 当前 ACL 是「应用层 token + namespace 白名单」，企业级应**镜像源系统 ACL**（Glean / M365 Purview 那种），数据模型已留扩展位（namespace 即隔离边界）。
+- ⚠️ OCR 需另装 `pytesseract` + 系统 `Tesseract` + `poppler`，未装时扫描件仅提示、不阻断入库。
 - ⚠️ 大文件（>50MB PDF）解析较慢，可加「后台任务 + 进度条」。
-- ⚠️ 没有登录鉴权，公网部署前必须加（否则谁都能问你的内部文档）。
+- 💡 **P2 待办（体验层）**：语义/命题分块（D13）、上下文压缩去重（D14）、流式响应 + 答案置信度评分（D15/D16）、多语言/跨模态（D17）；以及把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现。
 - 💡 可接 day22 的 `xhs-cover-gen` 思路，把「知识库问答」包装成可被外部调用的服务。
