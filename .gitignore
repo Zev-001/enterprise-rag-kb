@@ -1,0 +1,22 @@
+# 环境变量 / API key（绝不提交）
+.env
+
+# 知识库数据（运行后生成，含用户文档）
+data/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+env/
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.idea/
+.vscode/

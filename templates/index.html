@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>企业知识库问答系统</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">📚</span>
+        <div>
+          <h1>企业知识库问答</h1>
+          <p class="sub">上传公司文档，基于文档问答，答案可溯源</p>
+        </div>
+      </div>
+      <div class="kb-status" id="kbStatus">知识库：加载中…</div>
+    </header>
+
+    <main class="layout">
+      <!-- 左侧：上传 + 文档列表 -->
+      <aside class="sidebar">
+        <section class="upload-card">
+          <h2>① 上传文档</h2>
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="fileInput" multiple
+                   accept=".pdf,.docx,.txt,.md" hidden />
+            <div class="dz-inner">
+              <span class="dz-icon">⬆️</span>
+              <p>点击选择 或 拖拽文件到这里</p>
+              <small>支持 PDF / Word / TXT / Markdown（可多选）</small>
+            </div>
+          </label>
+          <div id="uploadMsg" class="upload-msg"></div>
+        </section>
+
+        <section class="doclist-card">
+          <h2>② 已入库文档</h2>
+          <ul id="docList" class="doc-list"><li class="empty">暂无文档</li></ul>
+        </section>
+      </aside>
+
+      <!-- 右侧：对话 -->
+      <section class="chat">
+        <div class="messages" id="messages">
+          <div class="msg bot">
+            <div class="bubble">
+              你好，我是企业知识库助手 👋<br/>
+              先在左边上传公司文档（员工手册、产品说明、制度文件都行），
+              然后直接在下面提问，我会基于文档回答并标出来源。
+            </div>
+          </div>
+        </div>
+
+        <form class="composer" id="composer">
+          <input type="text" id="question" placeholder="例如：年假怎么请？报销上限是多少？" autocomplete="off" />
+          <button type="submit" id="sendBtn">发送</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const fileInput = $("#fileInput");
+    const dropzone = $("#dropzone");
+    const uploadMsg = $("#uploadMsg");
+    const docList = $("#docList");
+    const kbStatus = $("#kbStatus");
+    const messages = $("#messages");
+    const composer = $("#composer");
+    const question = $("#question");
+    const sendBtn = $("#sendBtn");
+
+    function escapeHtml(s) {
+      return (s || "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    // 渲染一条消息
+    function addMessage(role, answer, sources) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg " + role;
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = escapeHtml(answer).replace(/\n/g, "<br/>");
+      wrap.appendChild(bubble);
+
+      if (sources && sources.length) {
+        const srcBox = document.createElement("div");
+        srcBox.className = "sources";
+        srcBox.innerHTML = "<div class='src-title'>📎 来源</div>";
+        sources.forEach((s) => {
+          const card = document.createElement("div");
+          card.className = "src-card";
+          card.innerHTML =
+            "<div class='src-head'>[" + s.n + "] 《" + escapeHtml(s.title) +
+            "》 <span class='src-score'>相关度 " + s.score + "</span></div>" +
+            "<div class='src-snippet'>" + escapeHtml(s.snippet) + "</div>";
+          srcBox.appendChild(card);
+        });
+        wrap.appendChild(srcBox);
+      }
+      messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function addThinking() {
+      const wrap = document.createElement("div");
+      wrap.className = "msg bot";
+      wrap.id = "thinking";
+      wrap.innerHTML = "<div class='bubble thinking'>正在查文档…</div>";
+      messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+    }
+    function removeThinking() {
+      const t = $("#thinking");
+      if (t) t.remove();
+    }
+
+    // 拉取知识库状态
+    async function refreshStats() {
+      try {
+        const r = await fetch("/api/stats");
+        const d = await r.json();
+        kbStatus.textContent = "知识库：" + d.docs.length + " 份文档 · " + d.chunks + " 个知识块";
+        if (d.docs.length === 0) {
+          docList.innerHTML = "<li class='empty'>暂无文档</li>";
+        } else {
+          docList.innerHTML = d.docs.map((x) => "<li>📄 " + escapeHtml(x) + "</li>").join("");
+        }
+      } catch (e) {
+        kbStatus.textContent = "知识库：连接失败";
+      }
+    }
+
+    // 上传
+    async function uploadFiles(fileList) {
+      if (!fileList.length) return;
+      uploadMsg.textContent = "上传中…";
+      const fd = new FormData();
+      for (const f of fileList) fd.append("files", f);
+      try {
+        const r = await fetch("/api/upload", { method: "POST", body: fd });
+        const d = await r.json();
+        if (d.ok) {
+          const ok = d.results.filter((x) => x.ok).length;
+          const fail = d.results.length - ok;
+          uploadMsg.innerHTML = "✅ 成功 " + ok + " 个，失败 " + fail + " 个";
+          await refreshStats();
+        } else {
+          uploadMsg.textContent = "❌ " + d.error;
+        }
+      } catch (e) {
+        uploadMsg.textContent = "❌ 上传失败：" + e.message;
+      }
+    }
+
+    fileInput.addEventListener("change", (e) => uploadFiles(e.target.files));
+    dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("drag"); });
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+    dropzone.addEventListener("drop", (e) => {
+      e.preventDefault(); dropzone.classList.remove("drag");
+      uploadFiles(e.dataTransfer.files);
+    });
+
+    // 提问
+    composer.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const q = question.value.trim();
+      if (!q) return;
+      addMessage("user", q);
+      question.value = "";
+      addThinking();
+      sendBtn.disabled = true;
+      try {
+        const r = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: q }),
+        });
+        const d = await r.json();
+        removeThinking();
+        if (d.ok) {
+          addMessage("bot", d.answer, d.sources);
+        } else {
+          addMessage("bot", "⚠️ " + d.error);
+        }
+      } catch (err) {
+        removeThinking();
+        addMessage("bot", "⚠️ 请求失败：" + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    });
+
+    refreshStats();
+  </script>
+</body>
+</html>
