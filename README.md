@@ -45,6 +45,11 @@
 | GraphRAG | `graph_rag.py` | **P1 补强**：实体抽取 + 轻量图谱多跳检索，`retrieval=graph` 启用（D7） |
 | Agentic RAG | `agentic_rag.py` | **P1 补强**：ReAct 式自问自答，`mode=agent` 启用（D8） |
 | 企业连接器 | `connectors.py` | **P1 补强**：Connector 基类 + 本地目录 / 网页连接器（D9） |
+| 语义分块 | `chunker.py` | **P2 补强**：语义/命题/模板多模式切块，`RAG_CHUNK_MODE` 切换（D13） |
+| 上下文压缩 | `context.py` | **P2 补强**：检索后合并去重压缩上下文，控 token 成本（D14） |
+| 答案缓存 | `cache.py` | **P2 补强**：同问秒回（1h TTL），缓存 key 区分检索模式（D15） |
+| 置信度评分 | `confidence.py` | **P2 补强**：检索分+引用+拒答占比算可信度，前端徽章展示（D16） |
+| 跨模态 | `multimodal.py` | **P2 补强**：表格/图片(OCR) 结构化入库，统一走一套检索（D17） |
 
 **技术选型理由（面试常问）**
 - `sentence-transformers` 的 `bge-small-zh-v1.5`：中文语义检索效果好的轻量模型，本地跑不联网也能检索。
@@ -197,6 +202,35 @@ $PY eval_rag.py            # 离线：检索召回率 + 可分性（默认 100% 
 $PY eval_rag.py --live     # 真机：连「资料里没提到」拒答话术一起验（需 DEEPSEEK_API_KEY）
 ```
 
+### P2 补强（体验层，对标高端系统的"感觉"，2026-08-31）
+
+> 阶段 C（P2）补齐 5 项体验（D13–D17）。原则不变：**零额外重依赖、可离线、等价对标**——语义分块用句群聚类而不是引第三方 LLM、流式走 SSE 而不是引 WebSocket 服务。
+
+| 缺陷 | 能力 | 落地 | 关键实现 |
+|---|---|---|---|
+| D13 语义分块 | 四种切块模式 | `chunker.py` | legacy 按段硬切 / semantic 句群聚类 / proposition 命题切 / template 表格模板切；`RAG_CHUNK_MODE` 切换，默认 semantic |
+| D14 上下文压缩 | 检索后瘦身 | `context.py` | 相邻块合并 + 近似重复去重，控 prompt token 成本，压缩统计随响应返回 |
+| D15 流式响应 + 缓存 | 边想边答 | `cache.py` + `ask_llm_stream` | SSE 逐 token 推流（前端打字机效果）；答案缓存 1h TTL，key 含检索模式防互相污染 |
+| D16 置信度评分 | 答案可信度 | `confidence.py` | 检索分 + 引用标注 + 按句拒答占比算分，输出 confidence/level/reason，前端徽章展示 |
+| D17 多语言/跨模态 | 双语 + 表格图片 | `multimodal.py` + 提示词 | 表格/图片(OCR) 结构化入库走同一检索；系统提示词要求「用提问的语言回答」 |
+
+**P2 新增接口速查**
+```bash
+# 流式问答（SSE 打字机效果）
+curl -N -X POST "http://127.0.0.1:5000/api/ask?token=$TK" -H 'Content-Type: application/json' \
+  -d '{"question":"年假有几天？","namespace":"demo","stream":true}'
+
+# 表格入库（D17，仅 admin）
+curl -X POST "http://127.0.0.1:5000/api/multimodal/ingest?token=$TK" -H 'Content-Type: application/json' \
+  -d '{"type":"table","namespace":"demo","filename":"报销标准.csv","title":"报销标准表","headers":["项目","上限"],"rows":[["住宿","500元/晚"]]}'
+
+# 缓存管理（GET 统计 / DELETE 清缓存，仅 admin）
+curl "http://127.0.0.1:5000/api/cache?token=$TK"
+curl -X DELETE "http://127.0.0.1:5000/api/cache?token=$TK&namespace=demo"
+```
+
+**前端体验**：打字机流式输出、置信度徽章（high/medium/low）、缓存命中标记、检索模式切换（默认/图谱）、跨模态来源卡片。
+
 **启用鉴权**
 ```bash
 # 设环境变量指定 admin token（不设则首次运行自动生成并写入 acl.json）
@@ -207,9 +241,9 @@ $PY app.py
 
 ---
 
-## 八、已知边界 / 下一步可扩展（P1 已收，剩 P2）
+## 八、已知边界 / 下一步可扩展（P2 已收）
 
-- ✅ **P0 + P1 已收敛**：Rerank / 表格抽取 / 模型可配置 / 鉴权+ACL / 量化评测（P0），以及 GraphRAG / Agentic RAG / 连接器 / 多轮上下文 / LLMOps / 持久化向量库（P1）均已落地并实测。
+- ✅ **P0 + P1 + P2 全收敛**：Rerank / 表格抽取 / 模型可配置 / 鉴权+ACL / 量化评测（P0）；GraphRAG / Agentic RAG / 连接器 / 多轮上下文 / LLMOps / 持久化向量库（P1）；语义分块 / 上下文压缩 / 流式+缓存 / 置信度评分 / 多语言跨模态（P2）均已落地并实测。
 - ⚠️ 当前 ACL 是「应用层 token + namespace 白名单」，企业级应**镜像源系统 ACL**（Glean / M365 Purview 那种），数据模型已留扩展位（namespace 即隔离边界）。
 - ⚠️ OCR 需另装 `pytesseract` + 系统 `Tesseract` + `poppler`，未装时扫描件仅提示、不阻断入库。
 - ⚠️ 大文件（>50MB PDF）解析较慢，可加「后台任务 + 进度条」。

@@ -56,6 +56,25 @@
           </div>
         </div>
 
+        <div class="composer-tools">
+          <label class="tool">
+            <span>检索</span>
+            <select id="retrieval">
+              <option value="default">语义+关键词（默认）</option>
+              <option value="graph">图谱多跳（D7）</option>
+            </select>
+          </label>
+          <label class="tool">
+            <input type="checkbox" id="agentMode" /> <span>智能体（D8）</span>
+          </label>
+          <label class="tool">
+            <input type="checkbox" id="streamMode" checked /> <span>流式（D15）</span>
+          </label>
+          <label class="tool">
+            <input type="checkbox" id="cacheMode" checked /> <span>缓存（D15）</span>
+          </label>
+        </div>
+
         <form class="composer" id="composer">
           <input type="text" id="question" placeholder="例如：年假怎么请？报销上限是多少？" autocomplete="off" />
           <button type="submit" id="sendBtn">发送</button>
@@ -89,31 +108,88 @@
       }[c]));
     }
 
-    // 渲染一条消息
-    function addMessage(role, answer, sources) {
+    // D16 置信度徽章：高=绿 / 中=黄 / 低=红，鼠标悬停看理由
+    function confidenceBadge(conf, level, reason) {
+      if (conf === undefined || conf === null) return "";
+      const pct = Math.round((conf || 0) * 100);
+      const lv = level || (pct >= 70 ? "high" : pct >= 40 ? "medium" : "low");
+      const label = { high: "可信", medium: "可核对", low: "建议复核" }[lv] || "可核对";
+      const tips = (reason || []).map(escapeHtml).join("；");
+      return "<span class='badge badge-" + lv + "' title='" + tips + "'>" +
+             "🎯 " + pct + "% " + label + "</span>";
+    }
+
+    // D14/D15 元信息行：命中块数、上下文压缩、是否命中缓存、检索模式
+    function metaLine(meta) {
+      if (!meta) return "";
+      const bits = [];
+      if (meta.hits !== undefined) bits.push("命中 " + meta.hits + " 块");
+      const c = meta.compress || {};
+      if (c.total_hits && c.chunks_in_ctx !== undefined) {
+        bits.push("上下文 " + c.total_hits + "→" + c.chunks_in_ctx + " 块" +
+                  (c.merged ? "（去重 " + c.merged + "）" : ""));
+      }
+      if (meta.mode && meta.mode !== "default") {
+        bits.push("模式 " + escapeHtml(meta.mode));
+      }
+      if (meta.from_cache) bits.push("⚡ 缓存命中");
+      if (meta.steps) bits.push("推理 " + meta.steps + " 步");
+      if (!bits.length) return "";
+      return "<div class='meta-line'>" + bits.map(escapeHtml).join(" · ") + "</div>";
+    }
+
+    // 渲染一条消息（sources/meta 支持事后更新，供流式用）
+    function addMessage(role, answer, sources, meta) {
       const wrap = document.createElement("div");
       wrap.className = "msg " + role;
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.innerHTML = escapeHtml(answer).replace(/\n/g, "<br/>");
+      bubble.innerHTML = escapeHtml(answer || "").replace(/\n/g, "<br/>");
       wrap.appendChild(bubble);
 
-      if (sources && sources.length) {
-        const srcBox = document.createElement("div");
-        srcBox.className = "sources";
-        srcBox.innerHTML = "<div class='src-title'>📎 来源</div>";
-        sources.forEach((s) => {
-          const card = document.createElement("div");
-          card.className = "src-card";
-          card.innerHTML =
-            "<div class='src-head'>[" + s.n + "] 《" + escapeHtml(s.title) +
-            "》 <span class='src-score'>相关度 " + s.score + "</span></div>" +
-            "<div class='src-snippet'>" + escapeHtml(s.snippet) + "</div>";
-          srcBox.appendChild(card);
-        });
-        wrap.appendChild(srcBox);
-      }
+      const metaBox = document.createElement("div");
+      metaBox.className = "answer-meta";
+      metaBox.innerHTML =
+        confidenceBadge(meta && meta.confidence, meta && meta.confidence_level,
+                        meta && meta.confidence_reason) + metaLine(meta);
+      wrap.appendChild(metaBox);
+
+      const srcBox = document.createElement("div");
+      srcBox.className = "sources";
+      wrap.appendChild(srcBox);
+      renderSources(srcBox, sources);
+
       messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+      return { wrap: wrap, bubble: bubble, metaBox: metaBox, srcBox: srcBox };
+    }
+
+    function renderSources(box, sources) {
+      if (!box) return;
+      if (!sources || !sources.length) { box.style.display = "none"; return; }
+      box.style.display = "";
+      box.innerHTML = "<div class='src-title'>📎 来源</div>";
+      sources.forEach((s) => {
+        const card = document.createElement("div");
+        card.className = "src-card";
+        const mod = s.modality && s.modality !== "text"
+          ? "<span class='src-mod'>" + escapeHtml(s.modality) + "</span>" : "";
+        card.innerHTML =
+          "<div class='src-head'>[" + s.n + "] 《" + escapeHtml(s.title) +
+          "》 " + mod + " <span class='src-score'>相关度 " + s.score + "</span></div>" +
+          "<div class='src-snippet'>" + escapeHtml(s.snippet) + "</div>";
+        box.appendChild(card);
+      });
+    }
+
+    // 流式过程中更新一条消息的内容与元信息
+    function updateMessage(handle, answer, sources, meta) {
+      if (!handle) return;
+      handle.bubble.innerHTML = escapeHtml(answer || "").replace(/\n/g, "<br/>");
+      handle.metaBox.innerHTML =
+        confidenceBadge(meta && meta.confidence, meta && meta.confidence_level,
+                        meta && meta.confidence_reason) + metaLine(meta);
+      renderSources(handle.srcBox, sources);
       messages.scrollTop = messages.scrollHeight;
     }
 
@@ -176,6 +252,67 @@
       uploadFiles(e.dataTransfer.files);
     });
 
+    // 会话：把服务端返回的 session_id 存起来，实现 D10 多轮追问（刷新页面即开新会话）
+    let sessionId = null;
+
+    function askBody(q, stream) {
+      return JSON.stringify({
+        question: q,
+        session_id: sessionId,
+        retrieval: $("#retrieval").value,
+        mode: $("#agentMode").checked ? "agent" : "default",
+        use_cache: $("#cacheMode").checked,
+        stream: !!stream,
+      });
+    }
+
+    // 流式读取 SSE：逐 token 追加到气泡，done 帧补来源与置信度
+    async function askStream(q) {
+      const r = await fetch("/api/ask" + tokenParam(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: askBody(q, true),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "", text = "", handle = null, done = null;
+      while (true) {
+        const { value, done: fin } = await reader.read();
+        if (fin) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          let ev;
+          try { ev = JSON.parse(line.slice(6)); } catch (_) { continue; }
+          if (ev.type === "delta") {
+            if (!handle) { removeThinking(); handle = addMessage("bot", "", [], null); }
+            text += ev.token || "";
+            handle.bubble.innerHTML = escapeHtml(text).replace(/\n/g, "<br/>");
+            messages.scrollTop = messages.scrollHeight;
+          } else if (ev.type === "done") {
+            done = ev;
+          } else if (ev.type === "error") {
+            throw new Error(ev.error || "流式失败");
+          }
+        }
+      }
+      if (done) {
+        if (done.session_id) sessionId = done.session_id;
+        const meta = {
+          confidence: done.confidence, confidence_level: done.confidence_level,
+          confidence_reason: done.confidence_reason, hits: done.hits,
+          compress: done.compress, from_cache: done.from_cache, mode: done.mode,
+        };
+        if (handle) updateMessage(handle, done.answer || text, done.sources, meta);
+        else addMessage("bot", done.answer || text, done.sources, meta);
+      } else if (!handle) {
+        addMessage("bot", text || "（无响应）", [], null);
+      }
+    }
+
     // 提问
     composer.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -185,18 +322,30 @@
       question.value = "";
       addThinking();
       sendBtn.disabled = true;
+      const useStream = $("#streamMode").checked && !$("#agentMode").checked;
       try {
-        const r = await fetch("/api/ask" + tokenParam(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: q }),
-        });
-        const d = await r.json();
-        removeThinking();
-        if (d.ok) {
-          addMessage("bot", d.answer, d.sources);
+        if (useStream) {
+          await askStream(q);
+          removeThinking();
         } else {
-          addMessage("bot", "⚠️ " + d.error);
+          const r = await fetch("/api/ask" + tokenParam(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: askBody(q, false),
+          });
+          const d = await r.json();
+          removeThinking();
+          if (d.ok) {
+            if (d.session_id) sessionId = d.session_id;
+            addMessage("bot", d.answer, d.sources, {
+              confidence: d.confidence, confidence_level: d.confidence_level,
+              confidence_reason: d.confidence_reason, hits: d.hits,
+              compress: d.compress, from_cache: d.from_cache, mode: d.mode,
+              steps: d.steps,
+            });
+          } else {
+            addMessage("bot", "⚠️ " + d.error);
+          }
         }
       } catch (err) {
         removeThinking();

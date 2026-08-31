@@ -37,6 +37,13 @@ from collections import Counter
 
 import requests
 
+# D13/D14/D15/D16/D17 补强（P2 / 阶段C）：新模块均零额外依赖
+import chunker as _chunker
+import context as _context
+import cache as _cache
+import confidence as _confidence
+import multimodal as _mm
+
 # ---------------------------------------------------------------- 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 知识库存这里：每个「知识库(namespace)」一个 jsonl 文件，实现多库隔离
@@ -98,31 +105,10 @@ def _key():
 
 
 # ---------------------------------------------------------------- 切块
-def chunk_text(text, max_chars=320, overlap=64):
-    """按段落切块，长段硬切并留重叠。通用版：不假设文档结构。"""
-    text = (text or "").strip()
-    if not text:
-        return []
-    blocks = re.split(r"\n\s*\n", text)
-    chunks, cur = [], ""
-    for b in blocks:
-        b = b.strip()
-        if not b:
-            continue
-        if len(cur) + len(b) <= max_chars:
-            cur = (cur + "\n" + b).strip() if cur else b
-        else:
-            if cur:
-                chunks.append(cur)
-            if len(b) > max_chars:
-                for i in range(0, len(b), max_chars - overlap):
-                    chunks.append(b[i:i + max_chars])
-                cur = ""
-            else:
-                cur = b
-    if cur:
-        chunks.append(cur)
-    return chunks
+def chunk_text(text, max_chars=320, overlap=64, mode="semantic"):
+    """按模式切块。D13：默认走语义分块（不切断句子、识别章节）；mode="legacy"
+    保留旧行为（固定字数硬切 + 重叠），保证向后兼容。"""
+    return _chunker.chunk_text(text, mode=mode, max_chars=max_chars, overlap=overlap)
 
 
 # ---------------------------------------------------------------- 入库
@@ -130,10 +116,13 @@ def _kb_path(namespace="default"):
     return os.path.join(KB_DIR, "kb_{0}.jsonl".format(namespace))
 
 
-def ingest_documents(docs, namespace="default", kb_path=None):
+def ingest_documents(docs, namespace="default", kb_path=None, chunk_mode="semantic"):
     """docs = [{"filename": "...", "title": "...", "text": "..."}, ...]
     切块并打元数据 (doc_id, filename, title, chunk_id, text)，写入知识库。
     返回写入的块数。
+
+    D13：新增 chunk_mode（semantic | legacy | proposition | template），
+    默认语义分块；doc 里也可带 `modality`/`meta` 字段走 D17 跨模态入库。
     """
     if kb_path is None:
         kb_path = _kb_path(namespace)
@@ -156,18 +145,27 @@ def ingest_documents(docs, namespace="default", kb_path=None):
         if not text:
             continue
         doc_id = re.sub(r"\W+", "", fn)[:40] or "doc"
-        for i, ch in enumerate(chunk_text(text)):
+        # D17：doc 可带 modality/meta（table / image），此时 text 已是渲染好的检索文本
+        modality = doc.get("modality", "text")
+        meta = doc.get("meta") or {}
+        for i, ch in enumerate(chunk_text(text, mode=chunk_mode)):
             cid = "{0}_{1}".format(doc_id, i)
             if cid in seen:
                 continue
             seen.add(cid)
-            rows.append({
+            row = {
                 "doc_id": doc_id,
                 "filename": fn,
                 "title": title.strip(),
                 "chunk_id": cid,
                 "text": ch,
-            })
+                "modality": modality,
+                # D13：记录切块方法，方便溯源与评测
+                "chunk_method": chunk_mode,
+            }
+            if meta:
+                row["meta"] = meta
+            rows.append(row)
             added += 1
     with open(kb_path, "w", encoding="utf-8") as f:
         for r in rows:
@@ -390,6 +388,8 @@ SYSTEM_GROUND = (
     "参考资料里没提到的，直接说「资料里没提到」，不许编、不许推测、不许用你训练时记得的东西。"
     "参考资料说不清楚，就照实说不清楚，不许替它圆。"
     "回答要简洁、口语化，像真人同事在解答。如果资料能回答，请在相关句子后用 [n] 标注引用了第几段资料。"
+    # D17 多语言：用提问的语言回答，别默认中文
+    "【语言】用用户提问时的语言回答：中文问题用中文，英文问题用英文，别自动翻译。"
     "最后可以加一句引导继续提问的话。"
 )
 
@@ -444,6 +444,53 @@ def ask_llm(prompt, temperature=0.3):
     """默认用防幻觉 system 提示作答。"""
     return ask_llm_raw(SYSTEM_GROUND, prompt, temperature=temperature)
 
+def ask_llm_stream(system, user, temperature=0.3):
+    """D15 流式作答（P2 / 阶段C）。逐 token yield，让前端能边想边打，长答案不卡顿。
+    端点不支持流式 / 出错时退化为 ask_llm_raw 整句，不中断。
+    """
+    key = _key()
+    if not key:
+        raise ValueError("DEEPSEEK_API_KEY 未设置，无法调大模型。")
+    api_url = os.environ.get("RAG_LLM_API_URL", API_URL)
+    model = os.environ.get("RAG_LLM_MODEL", MODEL)
+    try:
+        resp = requests.post(
+            api_url,
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+                "temperature": temperature,
+                "max_tokens": 700,
+                "stream": True,
+            },
+            timeout=120,
+            stream=True,
+        )
+        resp.raise_for_status()
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "ignore")
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                delta = obj["choices"][0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
+            except Exception:
+                continue
+    except Exception:
+        # 流式失败（端点不支持 / 网络抖动）→ 退化成整句，保证接口不挂
+        yield ask_llm_raw(system, user, temperature=temperature)
+
+
+
 
 def rewrite_query(question, history):
     """D10 补强（P1）：把追问改写成可独立检索的完备问题。
@@ -478,53 +525,147 @@ def rewrite_query(question, history):
     return question
 
 
-def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
-                 verbose=True, return_sources=True, history=None,
-                 retrieval="default"):
-    """检索 → 提示 → 大模型回答。返回 dict，含 answer 与 sources(可点击溯源)。
+def prepare_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
+                history=None, retrieval="default", modalities=None,
+                use_cache=True):
+    """检索 + 改写 + 压缩 + 模态过滤 + 拼 prompt。【不调模型】。
 
-    D10：传 history（多轮历史）会自动改写追问，让承接上一轮的问题也能检索到。
-    D7 ：retrieval="graph" 走 GraphRAG 多跳检索（默认仍是语义+关键词融合）。
+    拆出来的目的是让「普通问答」和「流式问答」共用同一套检索/压缩逻辑，
+    只差最后一步：前者调 ask_llm 整句，后者调 ask_llm_stream 逐 token。
+
+    返回 dict：{prompt, sources, effective_question, backend, hits, scores,
+                compress, from_cache, retrieval, namespace}
+    缓存命中时 prompt=None、from_cache=True，调方直接拿 answer 用。
     """
-    # D10：多轮改写
     effective_q = rewrite_query(question, history) if history else question
+
+    # D15：先查缓存（命中则完全跳过检索与调模型；key 区分检索模式）
+    if use_cache:
+        cached = _cache.cache_get(namespace, effective_q, mode=retrieval)
+        if cached:
+            d = dict(cached)
+            d["from_cache"] = True
+            d["prompt"] = None
+            return d
+
     # D7：检索模式
     if retrieval == "graph":
         try:
             import graph_rag as gr
             pairs = gr.retrieve_graph(effective_q, namespace=namespace, top_k=top_k)
+            # 图谱抽不到实体 / 实体无匹配 → 回退语义检索，避免小库空手而归
+            if not pairs:
+                pairs = retrieve(effective_q, top_k=top_k, namespace=namespace)
         except Exception:
             pairs = retrieve(effective_q, top_k=top_k, namespace=namespace)
     else:
         pairs = retrieve(effective_q, top_k=top_k, namespace=namespace)
+
+    # D17：按模态过滤（在阈值之前， modalities 之外的块连候选都不进）
+    pairs = _mm.filter_by_modalities(pairs, modalities)
     pairs = [(s, r) for s, r in pairs if s >= RELEVANCE_THRESHOLD]
-    ctx = _build_context(pairs)
-    prompt = USER_GROUND.format(question=effective_q, ctx=ctx or "（没有检索到相关资料）")
+
+    # D14：压缩/去重上下文（替代原来的 _build_context 硬截断）
+    ctx, compress_info = _context.compress_context(pairs)
+    prompt = USER_GROUND.format(
+        question=effective_q, ctx=ctx or "（没有检索到相关资料）")
 
     sources = [
         {"n": i + 1, "filename": r.get("filename", ""), "title": r.get("title", ""),
-         "score": round(s, 3), "snippet": r["text"][:200]}
-        for i, (s, r) in enumerate(pairs)
-    ]
+         "score": round(s, 3), "snippet": r["text"][:200],
+         "modality": r.get("modality", "text")}
+        for i, (s, r) in enumerate(pairs)]
 
+    return {
+        "prompt": prompt,
+        "sources": sources,
+        "scores": [s for s, _ in pairs],
+        "effective_question": effective_q,
+        "backend": _BACKEND or "tfidf",
+        "hits": len(pairs),
+        "compress": compress_info,
+        "from_cache": False,
+        "retrieval": retrieval,
+        "namespace": namespace,
+    }
+
+
+def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
+                 verbose=True, return_sources=True, history=None,
+                 retrieval="default", modalities=None, use_cache=True):
+    """检索 → 提示 → 大模型回答。返回 dict，含 answer 与 sources(可点击溯源)。
+
+    D10：传 history（多轮历史）会自动改写追问，让承接上一轮的问题也能检索到。
+    D7 ：retrieval="graph" 走 GraphRAG 多跳检索（默认仍是语义+关键词融合）。
+    D14：上下文先压缩/去重，再送进 prompt。
+    D15：use_cache=True 时相同问题命中缓存，不重复检索+调模型。
+    D16：额外输出 confidence / confidence_level / confidence_reason。
+    D17：modalities 可限定只检索 text/table/image 中的某几种模态。
+    """
+    prepared = prepare_ask(
+        question, top_k=top_k, namespace=namespace, history=history,
+        retrieval=retrieval, modalities=modalities, use_cache=use_cache)
+
+    if prepared["from_cache"]:
+        out = dict(prepared)
+        out.setdefault("from_cache", True)
+        if verbose:
+            print("📦 命中缓存，跳过检索与调模型：" + question)
+        return out
+
+    prompt = prepared["prompt"]
     if os.environ.get("RAG_TEST") == "1":
         answer = "（RAG_TEST=1 离线模式，未调用大模型）"
     else:
         answer = ask_llm(prompt)
 
-    out = {"question": question, "answer": answer, "sources": sources,
-           "backend": _BACKEND or "tfidf", "hits": len(pairs),
-           "effective_question": effective_q, "retrieval": retrieval}
+    # D16：置信度评分（离线/在线都要算，供输出与缓存复用）
+    conf = _confidence.score_confidence(
+        [(s, {}) for s in prepared["scores"]], answer,
+        threshold=RELEVANCE_THRESHOLD)
+
+    # D15：缓存真实答案（含置信度，命中时一起复用）。离线占位答案不缓存。
+    if os.environ.get("RAG_TEST") != "1":
+        try:
+            _cache.cache_set(prepared["namespace"], prepared["effective_question"],
+                mode=retrieval, value={
+                "answer": answer,
+                "sources": prepared["sources"],
+                "backend": prepared["backend"],
+                "hits": prepared["hits"],
+                "effective_question": prepared["effective_question"],
+                "retrieval": prepared["retrieval"],
+                "compress": prepared["compress"],
+                "confidence": conf["confidence"],
+                "confidence_level": conf["level"],
+                "confidence_reason": conf["reason"],
+                "confidence_factors": conf["factors"],
+            })
+        except Exception:
+            pass
+
+    out = {"question": question, "answer": answer, "sources": prepared["sources"],
+           "backend": prepared["backend"], "hits": prepared["hits"],
+           "effective_question": prepared["effective_question"],
+           "retrieval": retrieval,
+           "confidence": conf["confidence"],
+           "confidence_level": conf["level"],
+           "confidence_reason": conf["reason"],
+           "confidence_factors": conf["factors"],
+           "compress": prepared["compress"], "from_cache": False}
     if verbose:
         print("=" * 70)
         print("❓ " + question)
-        if effective_q != question:
-            print("🔄 改写后检索问句：" + effective_q)
+        if prepared["effective_question"] != question:
+            print("🔄 改写后检索问句：" + prepared["effective_question"])
         print("🔍 命中 {0} 块（后端：{1}｜模式：{2}）".format(
-            len(pairs), out["backend"], retrieval))
-        for s in sources:
-            print("  [{0}] {1}（{2}｜{3}）".format(s["n"], s["title"], s["filename"], s["score"]))
+            prepared["hits"], prepared["backend"], retrieval))
+        for s in prepared["sources"]:
+            print("  [{0}] {1}（{2}｜{3}）".format(
+                s["n"], s["title"], s["filename"], s["score"]))
         print("💬 " + answer)
+        print("📊 置信度：{0}（{1}）— {2}".format(
+            conf["confidence"], conf["level"], "；".join(conf["reason"])))
     return out
 
 

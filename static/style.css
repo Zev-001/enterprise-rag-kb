@@ -96,6 +96,30 @@ body {
 .src-score { color: var(--muted); font-weight: 400; font-size: 11px; }
 .src-snippet { font-size: 12px; color: #4a5159; line-height: 1.5; }
 
+/* P2 体验层：工具条（检索模式 / 智能体 / 流式 / 缓存） */
+.composer-tools {
+  display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+  padding: 10px 14px; border-top: 1px solid var(--border); background: #fbfcfe;
+}
+.tool { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.tool select {
+  font-size: 12px; padding: 4px 6px; border: 1px solid var(--border);
+  border-radius: 8px; background: #fff; color: var(--ink); outline: none;
+}
+.tool input[type="checkbox"] { accent-color: var(--brand); }
+
+/* P2 体验层：置信度徽章 + 元信息行 */
+.answer-meta { max-width: 78%; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 5px; }
+.badge { font-size: 11px; padding: 3px 9px; border-radius: 20px; cursor: help; white-space: nowrap; }
+.badge-high { background: #e6f6ea; color: #2f9e44; }
+.badge-medium { background: #fdf3e3; color: #b7791f; }
+.badge-low { background: #fdecea; color: var(--warn); }
+.meta-line { font-size: 11px; color: var(--muted); }
+.src-mod {
+  font-size: 10px; padding: 1px 6px; border-radius: 6px;
+  background: var(--brand-soft); color: var(--brand); font-weight: 400;
+}
+
 .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
 .composer input {
   flex: 1; padding: 11px 14px; border: 1px solid var(--border);

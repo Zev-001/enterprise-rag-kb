@@ -15,12 +15,14 @@ app.py —— 企业知识库问答系统的 Web 服务（Flask）。
 """
 
 import os
+import re
 import tempfile
 import json
 import time
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 
+import rag_core as rc
 from rag_core import kb_stats, grounded_ask, _load_env
 from ingest_docs import ingest_paths
 import auth as auth_mod
@@ -28,6 +30,9 @@ import session_store as sess_mod
 import rag_log as log_mod
 import agentic_rag as agentic_mod
 import connectors as conn_mod
+import multimodal as mm_mod
+import cache as cache_mod
+import confidence as conf_score_mod
 
 # 启动即加载 .env（和 agent.py 同一份），确保换 key 立刻生效
 _load_env()
@@ -105,11 +110,20 @@ def ask():
     mode = data.get("mode", "default")        # default | agent（D8）
     retrieval = data.get("retrieval", "default")  # default | graph（D7）
     session_id = data.get("session_id")       # D10 多轮
+    modalities = data.get("modalities")      # D17 跨模态：text|table|image
+    use_cache = bool(data.get("use_cache", True))  # D15 缓存
+    stream = bool(data.get("stream"))        # D15 流式
     g = _guard(namespace)
     if g:
         return g
     if not question:
         return jsonify({"ok": False, "error": "问题不能为空"}), 400
+
+    # D15：流式走独立生成器（SSE），普通问答走整句
+    if stream:
+        return _ask_stream(question, namespace=namespace, mode=mode,
+                           retrieval=retrieval, session_id=session_id,
+                           modalities=modalities)
 
     # D10：从会话取历史（用于查询改写）
     history = sess_mod.get_history(session_id) if session_id else None
@@ -119,7 +133,8 @@ def ask():
             out = agentic_mod.agentic_ask(question, namespace=namespace, verbose=False)
         else:
             out = grounded_ask(question, namespace=namespace, verbose=False,
-                               history=history, retrieval=retrieval)
+                               history=history, retrieval=retrieval,
+                               modalities=modalities, use_cache=use_cache)
     except ValueError as e:
         # 通常是没设 API key
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -132,6 +147,7 @@ def ask():
         backend=out.get("backend"), hits=out.get("hits", 0),
         latency=latency, ans_len=len(out.get("answer") or ""),
         src_count=len(out.get("sources") or []), refused=refused,
+        cached=bool(out.get("from_cache")),
     )
     # D10：把这一轮写进会话（没有 session_id 也建一个，方便前端连续追问）
     if not session_id:
@@ -148,8 +164,168 @@ def ask():
         "mode": mode if mode != "default" else retrieval,
         "effective_question": out.get("effective_question"),
         "steps": out.get("steps"),
+        # D16 置信度
+        "confidence": out.get("confidence"),
+        "confidence_level": out.get("confidence_level"),
+        "confidence_reason": out.get("confidence_reason"),
+        # D14 上下文压缩 / D15 缓存
+        "compress": out.get("compress"),
+        "from_cache": bool(out.get("from_cache")),
     })
 
+
+def _sse(obj):
+    """SSE 帧：data: {json}\n\n"""
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+def _ask_stream(question, namespace="default", mode="default", retrieval="default",
+                session_id=None, modalities=None):
+    """D15 流式问答：以 SSE 逐 token 推给前端，边想边打，长答案不卡顿。
+    agent 模式暂不支持流式，退回整句一次性下发。
+    """
+    history = sess_mod.get_history(session_id) if session_id else None
+    t0 = time.time()
+
+    def gen():
+        nonlocal session_id
+        out = None
+        try:
+            if mode == "agent":
+                out = agentic_mod.agentic_ask(question, namespace=namespace, verbose=False)
+                yield _sse({"type": "delta", "token": out.get("answer", "")})
+            else:
+                prepared = rc.prepare_ask(
+                    question, namespace=namespace, history=history,
+                    retrieval=retrieval, modalities=modalities, use_cache=True)
+                if prepared.get("from_cache"):
+                    cached_ans = prepared.get("answer", "") or ""
+                    yield _sse({"type": "delta", "token": cached_ans, "cached": True})
+                    out = dict(prepared)
+                else:
+                    full = []
+                    for tok in rc.ask_llm_stream(rc.SYSTEM_GROUND, prepared["prompt"]):
+                        full.append(tok)
+                        yield _sse({"type": "delta", "token": tok})
+                    answer = "".join(full)
+                    conf = conf_score_mod.score_confidence(
+                        [(s, {}) for s in prepared.get("scores", [])], answer,
+                        threshold=rc.RELEVANCE_THRESHOLD)
+                    try:
+                        cache_mod.cache_set(prepared["namespace"],
+                                            prepared["effective_question"],
+                                            mode=prepared["retrieval"], value={
+                                                "answer": answer,
+                                                "sources": prepared["sources"],
+                                                "backend": prepared["backend"],
+                                                "hits": prepared["hits"],
+                                                "effective_question": prepared["effective_question"],
+                                                "retrieval": prepared["retrieval"],
+                                                "compress": prepared["compress"],
+                                                "confidence": conf["confidence"],
+                                                "confidence_level": conf["level"],
+                                                "confidence_reason": conf["reason"],
+                                                "confidence_factors": conf["factors"],
+                                            })
+                    except Exception:
+                        pass
+                    out = {"question": question, "answer": answer,
+                           "sources": prepared["sources"],
+                           "backend": prepared["backend"],
+                           "hits": prepared["hits"],
+                           "effective_question": prepared["effective_question"],
+                           "retrieval": retrieval,
+                           "confidence": conf["confidence"],
+                           "confidence_level": conf["level"],
+                           "confidence_reason": conf["reason"],
+                           "confidence_factors": conf["factors"],
+                           "compress": prepared["compress"],
+                           "from_cache": False}
+        except ValueError as e:
+            yield _sse({"type": "error", "error": str(e)})
+            return
+        except Exception as e:
+            yield _sse({"type": "error", "error": "流式失败：" + str(e)})
+            return
+
+        latency = round(time.time() - t0, 3)
+        answer = out.get("answer", "")
+        refused = "资料里没提到" in answer
+        log_mod.log_event(
+            namespace=namespace, question=question,
+            mode=mode if mode != "default" else retrieval,
+            backend=out.get("backend"), hits=out.get("hits", 0),
+            latency=latency, ans_len=len(answer),
+            src_count=len(out.get("sources") or []), refused=refused,
+            cached=bool(out.get("from_cache")),
+        )
+        if not session_id:
+            session_id = sess_mod.new_session()
+        sess_mod.append(session_id, question, answer, out.get("sources"), namespace)
+        yield _sse({
+            "type": "done", "ok": True, "answer": answer,
+            "sources": out.get("sources"), "backend": out.get("backend"),
+            "hits": out.get("hits"), "session_id": session_id,
+            "mode": mode if mode != "default" else retrieval,
+            "effective_question": out.get("effective_question"),
+            "confidence": out.get("confidence"),
+            "confidence_level": out.get("confidence_level"),
+            "confidence_reason": out.get("confidence_reason"),
+            "compress": out.get("compress"),
+            "from_cache": bool(out.get("from_cache")),
+        })
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream")
+
+
+@app.route("/api/multimodal/ingest", methods=["POST"])
+def multimodal_ingest():
+    """D17 跨模态入库（仅 admin）。支持 table / image 两种模态，共用同一套检索。
+    table: {"type":"table","headers":[...],"rows":[[...],...],"title":"...","filename":"...","namespace":"..."}
+    image: {"type":"image","image_b64":"..."/"image_path":"...","title":"...","filename":"...","namespace":"..."}
+    """
+    if not _is_admin():
+        return jsonify({"ok": False, "error": "该接口仅 admin 可用"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    mtype = data.get("type")
+    namespace = data.get("namespace", "default")
+    filename = data.get("filename", "multimodal")
+    title = data.get("title", filename)
+    doc_id = re.sub(r"\W+", "", filename)[:40] or "doc"
+    try:
+        if mtype == "table":
+            chunk = mm_mod.table_chunk(
+                data.get("headers") or [], data.get("rows") or [],
+                title, filename, doc_id, 0)
+        elif mtype == "image":
+            ocr = ""
+            if data.get("image_path"):
+                ocr = mm_mod.ocr_image_file(data["image_path"])
+            chunk = mm_mod.image_chunk(
+                ocr, title, filename, doc_id, 0,
+                image_path=data.get("image_path"), image_b64=data.get("image_b64"))
+        else:
+            return jsonify({"ok": False, "error": "未知模态类型：{0}".format(mtype)}), 400
+        added = rc.ingest_documents([chunk], namespace=namespace)
+        return jsonify({"ok": True, "chunks_added": added,
+                        "modality": chunk["modality"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/cache", methods=["GET", "DELETE"])
+def cache_api():
+    """D15 缓存管理：GET 看统计，DELETE 清缓存（仅 admin）。"""
+    if request.method == "DELETE":
+        if not _is_admin():
+            return jsonify({"ok": False, "error": "该接口仅 admin 可用"}), 403
+        ns = request.args.get("namespace")
+        cache_mod.cache_invalidate(namespace=ns)
+        return jsonify({"ok": True, "invalidated_namespace": ns})
+    g = _guard("default")
+    if g:
+        return g
+    return jsonify({"ok": True, **cache_mod.cache_stats()})
 
 @app.route("/api/session", methods=["GET", "POST"])
 def session_api():
