@@ -175,6 +175,8 @@ def ask():
         # D14 上下文压缩 / D15 缓存
         "compress": out.get("compress"),
         "from_cache": bool(out.get("from_cache")),
+        # D21 内容指纹：本次回答基于哪个知识库版本（变化即缓存自动失效）
+        "kb_fp": out.get("kb_fp"),
         # D20 治理可观测：本次召回前拦了哪些过期/未审核块
         "meta_filtered": out.get("meta_filtered") or rc.last_meta_filter(),
     })
@@ -246,7 +248,9 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
                     try:
                         cache_mod.cache_set(prepared["namespace"],
                                             prepared["effective_question"],
-                                            mode=prepared["retrieval"], value={
+                                            mode=prepared["retrieval"],
+                                            kb_fingerprint=prepared.get("kb_fp"),
+                                            value={
                                                 "answer": answer,
                                                 "sources": prepared["sources"],
                                                 "backend": prepared["backend"],
@@ -275,6 +279,7 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
                            "confidence_factors": conf["factors"],
                            "qc": qc, "qc_action": qc_action,
                            "compress": prepared["compress"],
+                           "kb_fp": prepared.get("kb_fp"),
                            "from_cache": False}
         except ValueError as e:
             yield _sse({"type": "error", "error": str(e)})
@@ -310,6 +315,7 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
             "qc_action": out.get("qc_action", "warn"),
             "compress": out.get("compress"),
             "from_cache": bool(out.get("from_cache")),
+            "kb_fp": out.get("kb_fp"),
             "meta_filtered": out.get("meta_filtered") or rc.last_meta_filter(),
         })
 
@@ -428,6 +434,8 @@ def stats():
         "docs": st["docs"],
         "chunks": st["chunks"],
         "namespace": namespace,
+        # D21 知识库版本指纹：变了 = 缓存里同问题的旧答案自动作废
+        "kb_fp": rc.kb_fingerprint(namespace),
         # D20 治理健康度：库里有多少块被时效/审核规则拦在检索之外
         "meta": st.get("meta") or {"total": st["chunks"], "hidden": 0},
     })

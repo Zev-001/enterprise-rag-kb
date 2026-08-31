@@ -213,7 +213,7 @@ $PY eval_rag.py --live     # 真机：连「资料里没提到」拒答话术一
 |---|---|---|---|
 | D13 语义分块 | 四种切块模式 | `chunker.py` | legacy 按段硬切 / semantic 句群聚类 / proposition 命题切 / template 表格模板切；`RAG_CHUNK_MODE` 切换，默认 semantic |
 | D14 上下文压缩 | 检索后瘦身 | `context.py` | 相邻块合并 + 近似重复去重，控 prompt token 成本，压缩统计随响应返回 |
-| D15 流式响应 + 缓存 | 边想边答 | `cache.py` + `ask_llm_stream` | SSE 逐 token 推流（前端打字机效果）；答案缓存 1h TTL，key 含检索模式防互相污染 |
+| D15 流式响应 + 缓存 | 边想边答 | `cache.py` + `ask_llm_stream` | SSE 逐 token 推流（前端打字机效果）；答案缓存 1h TTL，key 含检索模式防互相污染。**D21 内容指纹失效**：缓存条目绑定知识库指纹（`rag_core.kb_fingerprint`，文件字节 md5 + mtime 缓存），知识一变旧答案自动作废，无需手动清缓存 |
 | D16 置信度评分 | 答案可信度 | `confidence.py` | 检索分 + 引用标注 + 按句拒答占比算分，输出 confidence/level/reason，前端徽章展示 |
 | D17 多语言/跨模态 | 双语 + 表格图片 | `multimodal.py` + 提示词 | 表格/图片(OCR) 结构化入库走同一检索；系统提示词要求「用提问的语言回答」 |
 
@@ -353,6 +353,6 @@ $PY app.py
 - ⚠️ 当前 ACL 是「应用层 token + namespace 白名单」，企业级应**镜像源系统 ACL**（Glean / M365 Purview 那种），数据模型已留扩展位（namespace 即隔离边界）。
 - ⚠️ OCR 需另装 `pytesseract` + 系统 `Tesseract` + `poppler`，未装时扫描件仅提示、不阻断入库。
 - ⚠️ 大文件（>50MB PDF）解析较慢，可加「后台任务 + 进度条」。
-- ✅ **额外补强**：答案质检改 JSON Schema 硬约束（`schema_qc.py`）+ 引用内容级回验（`evidence_verify.py`）+ 召回前元数据过滤（`meta_filter.py`），三件套借鉴 GEOFlow 质量门禁/知识治理——替代拒答正则、抓引用幻觉、过期/未审核资料进不了检索。
-- 💡 **下一步可做**：把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现；内容指纹（内容+prompt+知识 hash）缓存 key，知识变了缓存自动失效（`content_hash` 已就位）；引用块加 `content_hash` 发布时回验。
+- ✅ **额外补强**：答案质检改 JSON Schema 硬约束（`schema_qc.py`）+ 引用内容级回验（`evidence_verify.py`）+ 召回前元数据过滤（`meta_filter.py`）+ 内容指纹缓存失效（`cache.py` + `kb_fingerprint`），四件套借鉴 GEOFlow 质量门禁/知识治理——替代拒答正则、抓引用幻觉、过期/未审核资料进不了检索、知识一变旧答案自动作废。
+- 💡 **下一步可做**：把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现；引用块加 `content_hash` 发布时回验；缓存命中/失效指标进 LLMOps 看板。
 - 💡 可接 day22 的 `xhs-cover-gen` 思路，把「知识库问答」包装成可被外部调用的服务。

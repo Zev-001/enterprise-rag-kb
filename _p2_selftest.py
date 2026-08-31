@@ -113,7 +113,9 @@ check("from_cache 默认 False", out.get("from_cache") is False)
 print("   confidence:", out["confidence"], out["confidence_level"], out["confidence_reason"])
 
 # 缓存命中路径：离线占位答案不入库（缓存占位没意义），这里手工灌一条真实缓存再测
-cache.cache_set("demo", "年假有几天", mode="default", value={
+# D21：缓存条目绑定知识库指纹，手工灌缓存要带上当前指纹（否则被当旧答案作废）
+_demo_fp = rc.kb_fingerprint("demo")
+cache.cache_set("demo", "年假有几天", mode="default", kb_fingerprint=_demo_fp, value={
     "answer": "年假每年最多 5 天[1]。", "sources": [],
     "effective_question": "年假有几天", "retrieval": "default",
     "compress": {"chunks_in_ctx": 1, "merged": 0, "deduped": 0, "chars": 20},

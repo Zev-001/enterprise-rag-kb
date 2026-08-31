@@ -30,6 +30,7 @@ rag_core.py —— 企业知识库问答系统的「检索 + 防幻觉」核心�
 """
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -118,6 +119,38 @@ def chunk_text(text, max_chars=320, overlap=64, mode="semantic"):
 # ---------------------------------------------------------------- 入库
 def _kb_path(namespace="default"):
     return os.path.join(KB_DIR, "kb_{0}.jsonl".format(namespace))
+
+
+# D21：知识库内容指纹（对标 GEOFlow input_fingerprint）
+# {kb_path: (mtime, size, fingerprint)}——文件没变就直接复用指纹，不重复读盘
+_FP_CACHE = {}
+
+
+def kb_fingerprint(namespace="default", kb_path=None):
+    """知识库内容指纹：kb 文件字节 md5 前 16 位。
+
+    用途：答案缓存 key 绑定此指纹（cache.cache_get/set 的 kb_fingerprint），
+    知识库一变（入库/删库/改库）指纹立刻变，旧答案自动失效——
+    不再依赖「入库后记得手动清缓存」这种人工纪律。
+    按 (mtime, size) 缓存：文件没动过直接返回上次的指纹，不重复读盘。
+    """
+    if kb_path is None:
+        kb_path = _kb_path(namespace)
+    try:
+        st = os.stat(kb_path)
+        sig = (st.st_mtime, st.st_size)
+        hit = _FP_CACHE.get(kb_path)
+        if hit and (hit[0], hit[1]) == sig:
+            return hit[2]
+        h = hashlib.md5()
+        with open(kb_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        fp = h.hexdigest()[:16]
+        _FP_CACHE[kb_path] = (sig[0], sig[1], fp)
+        return fp
+    except FileNotFoundError:
+        return "empty"  # 库不存在也算一种状态（空库的答案别污染有库之后）
 
 
 def ingest_documents(docs, namespace="default", kb_path=None, chunk_mode="semantic"):
@@ -587,9 +620,13 @@ def prepare_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     """
     effective_q = rewrite_query(question, history) if history else question
 
+    # D21：算当前知识库指纹——缓存条目绑定指纹，知识一变旧答案自动失效
+    kb_fp = kb_fingerprint(namespace)
+
     # D15：先查缓存（命中则完全跳过检索与调模型；key 区分检索模式）
     if use_cache:
-        cached = _cache.cache_get(namespace, effective_q, mode=retrieval)
+        cached = _cache.cache_get(namespace, effective_q, mode=retrieval,
+                                  kb_fingerprint=kb_fp)
         if cached:
             d = dict(cached)
             d["from_cache"] = True
@@ -636,6 +673,7 @@ def prepare_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
         "from_cache": False,
         "retrieval": retrieval,
         "namespace": namespace,
+        "kb_fp": kb_fp,
         # D20：治理可观测——本次检索拦了哪些过期/未审核块
         "meta_filtered": _LAST_META_FILTER,
     }
@@ -694,7 +732,7 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     if os.environ.get("RAG_TEST") != "1":
         try:
             _cache.cache_set(prepared["namespace"], prepared["effective_question"],
-                mode=retrieval, value={
+                mode=retrieval, kb_fingerprint=prepared.get("kb_fp"), value={
                 "answer": answer,
                 "sources": prepared["sources"],
                 "backend": prepared["backend"],
