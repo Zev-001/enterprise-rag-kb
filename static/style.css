@@ -114,6 +114,8 @@ body {
 .badge-high { background: #e6f6ea; color: #2f9e44; }
 .badge-medium { background: #fdf3e3; color: #b7791f; }
 .badge-low { background: #fdecea; color: var(--warn); }
+/* JSON Schema 质检徽章：muted = 拒答/兜底（中性，不算风险） */
+.badge-muted { background: #eef1f5; color: #6b7280; }
 .meta-line { font-size: 11px; color: var(--muted); }
 .src-mod {
   font-size: 10px; padding: 1px 6px; border-radius: 6px;

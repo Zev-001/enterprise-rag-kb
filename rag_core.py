@@ -43,6 +43,8 @@ import context as _context
 import cache as _cache
 import confidence as _confidence
 import multimodal as _mm
+# 借鉴 GEOFlow 质量门禁：答案质检走 JSON Schema 硬约束
+import schema_qc as _qc
 
 # ---------------------------------------------------------------- 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -416,8 +418,11 @@ def _build_context(pairs, cap_chars=1200):
     return "\n".join(out)
 
 
-def ask_llm_raw(system, user, temperature=0.3):
-    """底层 LLM 调用，system/user 都可自定义（D8 Agentic / D10 改写复用）。"""
+def ask_llm_raw(system, user, temperature=0.3, max_tokens=700):
+    """底层 LLM 调用，system/user 都可自定义（D8 Agentic / D10 改写复用）。
+
+    max_tokens 可覆盖：质检（schema_qc）要输出完整 JSON 台账，默认 700 可能截断。
+    """
     key = _key()
     if not key:
         raise ValueError("DEEPSEEK_API_KEY 未设置，无法调大模型。")
@@ -432,7 +437,7 @@ def ask_llm_raw(system, user, temperature=0.3):
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": temperature,
-            "max_tokens": 700,
+            "max_tokens": max_tokens,
         },
         timeout=60,
     )
@@ -619,10 +624,22 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     else:
         answer = ask_llm(prompt)
 
-    # D16：置信度评分（离线/在线都要算，供输出与缓存复用）
+    # D16：先用启发式算一版置信度，作为质检失败时的兜底基线
     conf = _confidence.score_confidence(
         [(s, {}) for s in prepared["scores"]], answer,
         threshold=RELEVANCE_THRESHOLD)
+
+    # JSON Schema 硬约束质检（默认开；RAG_QC_MODE=off 可关）
+    # 拿到结构化证据台账后，用证据比例重算落地性，不再靠拒答正则猜
+    qc = _qc.run_qc(prepared["effective_question"], answer, prepared["sources"],
+                    hits=prepared["hits"], level=conf["level"], verbose=verbose)
+    qc_action = "warn"
+    if qc and (qc.get("mode", "") or "").startswith("json"):
+        conf = _confidence.score_confidence(
+            [(s, {}) for s in prepared["scores"]], answer,
+            threshold=RELEVANCE_THRESHOLD, qc=qc)
+        # 门禁动作：RAG_QC_ACTION=block 时把无依据答案拦下来
+        answer, qc_action = _qc.apply_action(qc, answer)
 
     # D15：缓存真实答案（含置信度，命中时一起复用）。离线占位答案不缓存。
     if os.environ.get("RAG_TEST") != "1":
@@ -640,6 +657,8 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
                 "confidence_level": conf["level"],
                 "confidence_reason": conf["reason"],
                 "confidence_factors": conf["factors"],
+                "qc": qc,
+                "qc_action": qc_action,
             })
         except Exception:
             pass
@@ -652,6 +671,7 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
            "confidence_level": conf["level"],
            "confidence_reason": conf["reason"],
            "confidence_factors": conf["factors"],
+           "qc": qc, "qc_action": qc_action,
            "compress": prepared["compress"], "from_cache": False}
     if verbose:
         print("=" * 70)
@@ -666,6 +686,13 @@ def grounded_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
         print("💬 " + answer)
         print("📊 置信度：{0}（{1}）— {2}".format(
             conf["confidence"], conf["level"], "；".join(conf["reason"])))
+        if qc:
+            s = qc.get("summary") or {}
+            print("🧪 质检：{0}（模式 {1}｜断言 {2} 条：{3} 有据 / {4} 弱据 / {5} 无据）".format(
+                qc.get("status"), qc.get("mode"), s.get("claims", 0),
+                s.get("supported", 0), s.get("weak", 0), s.get("unsupported", 0)))
+            if qc.get("errors"):
+                print("   ⚠️ 校验问题：" + "；".join(qc["errors"][:3]))
     return out
 
 

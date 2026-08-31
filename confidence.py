@@ -52,8 +52,17 @@ def _is_full_refusal(answer):
     return _refusal_ratio(answer) >= 0.85
 
 
-def score_confidence(pairs, answer, threshold=0.05):
+def score_confidence(pairs, answer, threshold=0.05, qc=None):
     """pairs = [(score, row), ...]；answer = 模型回答文本。
+    qc = run_qc() 的结构化质检结果（可选）。
+
+    传了 qc 且它是 JSON 模式（非启发式回退）时，groundedness 改由**证据台账**
+    算出，而不是靠拒答正则猜——这是引入 JSON Schema 硬约束后的升级点：
+      - 证据比例（supported 算 1、weak 算 0.5）直接映射落地性
+      - status 四态给总分设天花板（unsupported 再高的检索分也压到 0.3 以下）
+      - 模型自评 confidence 按 3 成权重融合，作为「模型自己心虚」的信号
+
+    没传 qc / qc 是回退结果时，行为与改造前完全一致（不回归）。
     返回 dict：{confidence, level, factors, reason}
     """
     answer = answer or ""
@@ -107,6 +116,34 @@ def score_confidence(pairs, answer, threshold=0.05):
         conf = min(conf, 0.15)
     conf = max(0.0, min(1.0, conf))
 
+    # ---------- JSON Schema 质检融合（schema_qc）----------
+    # 仅当 qc 是真实的结构化结果（mode 以 json 开头）时接管落地性评分；
+    # 回退/未启用质检时上面三行原样生效，行为与改造前一致（不回归）。
+    qc_mode = (qc or {}).get("mode", "") or ""
+    qc_on = bool(qc) and qc_mode.startswith("json")
+    if qc_on:
+        st = qc.get("status")
+        summ = qc.get("summary") or {}
+        ev_ratio = float(summ.get("evidence_ratio", 0.0) or 0.0)
+        n_claims = int(summ.get("claims", 0) or 0)
+        # 证据台账比例 → 落地性：全 supported 满分，全 unsupported 接近 0
+        if n_claims:
+            grounded = round(0.2 + 0.75 * ev_ratio, 3)
+        else:
+            grounded = {"refused": 0.1, "unsupported": 0.15,
+                        "partial": 0.6}.get(st, 0.8)
+        conf = 0.35 * retrieval + 0.25 * coverage + 0.40 * grounded
+        # 模型自评占三成权重（模型自己心虚也是信号）
+        if isinstance(qc.get("confidence"), (int, float)):
+            conf = 0.7 * conf + 0.3 * float(qc["confidence"])
+        # status 天花板：unsupported 检索分再高也不许上 0.3
+        cap = {"refused": 0.15, "unsupported": 0.30, "partial": 0.60}.get(st)
+        if cap is not None:
+            conf = min(conf, cap)
+        conf = max(0.0, min(1.0, conf))
+        refused = (st == "refused")
+        partial = (st == "partial")
+
     level = "high" if conf >= 0.7 else ("medium" if conf >= 0.4 else "low")
 
     reason = []
@@ -120,7 +157,21 @@ def score_confidence(pairs, answer, threshold=0.05):
         reason.append("覆盖充分（{0} 块）".format(n))
     else:
         reason.append("覆盖一般（{0} 块）".format(n))
-    if refused:
+    if qc_on:
+        # 质检口径替代拒答正则（更适合多语言场景）
+        summ = qc.get("summary") or {}
+        reason.append("质检判定：{0}".format(
+            {"answered": "有据可答", "partial": "部分有据",
+             "refused": "整体拒答", "unsupported": "无依据（疑似幻觉）"}.get(
+                 qc.get("status"), str(qc.get("status")))))
+        reason.append("断言 {0} 条：{1} 条有据 / {2} 条弱据 / {3} 条无据".format(
+            summ.get("claims", 0), summ.get("supported", 0),
+            summ.get("weak", 0), summ.get("unsupported", 0)))
+        for r in (qc.get("reasons") or [])[:2]:
+            reason.append(r)
+        if qc.get("missing"):
+            reason.append("资料缺口：{0}".format(qc["missing"]))
+    elif refused:
         reason.append("整体拒答，视为低可信")
     elif partial:
         reason.append("部分拒答（约 {0:.0%} 篇幅为拒答），其余有依据".format(ratio))
@@ -132,6 +183,7 @@ def score_confidence(pairs, answer, threshold=0.05):
     return {
         "confidence": round(conf, 3),
         "level": level,
+        "qc_mode": qc_mode or None,
         "factors": {
             "retrieval": round(retrieval, 3),
             "coverage": round(coverage, 3),

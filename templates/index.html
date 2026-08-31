@@ -119,6 +119,44 @@
              "🎯 " + pct + "% " + label + "</span>";
     }
 
+    // JSON Schema 硬约束质检徽章（schema_qc，借鉴 GEOFlow 质量门禁）
+    // 四态质检 + 兜底态，鼠标悬停看逐条断言台账与资料缺口
+    function qcBadge(qc, action) {
+      if (!qc || !qc.status) return "";
+      const st = qc.status;
+      const mode = qc.mode || "";
+      const s = qc.summary || {};
+      // 回退/短路态：诚实标注「不是结构化判定」，别让人误当成硬证据
+      if (mode.indexOf("json") !== 0) {
+        const tip = (qc.reasons || []).concat(qc.errors || []).map(escapeHtml).join("；");
+        return "<span class='badge badge-muted' title='" + (tip || "未做结构化质检") + "'>" +
+               "🔍 启发式兜底 · " + escapeHtml(st) + "</span>";
+      }
+      const label = { answered: "有据可答", partial: "部分有据",
+                      refused: "资料未提及", unsupported: "无依据·疑似幻觉" }[st] || st;
+      const cls = st === "answered" ? "badge-high"
+                : st === "partial" ? "badge-medium"
+                : st === "refused" ? "badge-muted" : "badge-low";
+      const icon = st === "answered" ? "✅" : st === "partial" ? "⚠️"
+                 : st === "refused" ? "🚫" : "⛔";
+      const tips = [
+        "断言 " + (s.claims || 0) + " 条：" + (s.supported || 0) + " 有据 / " +
+          (s.weak || 0) + " 弱据 / " + (s.unsupported || 0) + " 无据",
+      ].concat(qc.reasons || []).concat(qc.errors || []).map(escapeHtml).join("；");
+      let html = "<span class='badge " + cls + "' title='" + tips + "'>" +
+                 icon + " " + label + "</span>";
+      if (qc.missing) {
+        const m = escapeHtml(String(qc.missing));
+        html += "<span class='badge badge-muted' title='资料缺口：" + m + "'>" +
+                "📌 缺口：" + m.slice(0, 18) + "</span>";
+      }
+      if (action === "block" && st === "unsupported") {
+        html += "<span class='badge badge-low' " +
+                "title='RAG_QC_ACTION=block：无依据答案已被门禁拦截'>🛑 已拦截</span>";
+      }
+      return html;
+    }
+
     // D14/D15 元信息行：命中块数、上下文压缩、是否命中缓存、检索模式
     function metaLine(meta) {
       if (!meta) return "";
@@ -151,7 +189,8 @@
       metaBox.className = "answer-meta";
       metaBox.innerHTML =
         confidenceBadge(meta && meta.confidence, meta && meta.confidence_level,
-                        meta && meta.confidence_reason) + metaLine(meta);
+                        meta && meta.confidence_reason) +
+        qcBadge(meta && meta.qc, meta && meta.qc_action) + metaLine(meta);
       wrap.appendChild(metaBox);
 
       const srcBox = document.createElement("div");
@@ -188,7 +227,8 @@
       handle.bubble.innerHTML = escapeHtml(answer || "").replace(/\n/g, "<br/>");
       handle.metaBox.innerHTML =
         confidenceBadge(meta && meta.confidence, meta && meta.confidence_level,
-                        meta && meta.confidence_reason) + metaLine(meta);
+                        meta && meta.confidence_reason) +
+        qcBadge(meta && meta.qc, meta && meta.qc_action) + metaLine(meta);
       renderSources(handle.srcBox, sources);
       messages.scrollTop = messages.scrollHeight;
     }
@@ -305,6 +345,7 @@
           confidence: done.confidence, confidence_level: done.confidence_level,
           confidence_reason: done.confidence_reason, hits: done.hits,
           compress: done.compress, from_cache: done.from_cache, mode: done.mode,
+          qc: done.qc, qc_action: done.qc_action,
         };
         if (handle) updateMessage(handle, done.answer || text, done.sources, meta);
         else addMessage("bot", done.answer || text, done.sources, meta);
@@ -341,6 +382,7 @@
               confidence: d.confidence, confidence_level: d.confidence_level,
               confidence_reason: d.confidence_reason, hits: d.hits,
               compress: d.compress, from_cache: d.from_cache, mode: d.mode,
+              qc: d.qc, qc_action: d.qc_action,
               steps: d.steps,
             });
           } else {

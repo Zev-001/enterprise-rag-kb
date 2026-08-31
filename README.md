@@ -50,6 +50,7 @@
 | 答案缓存 | `cache.py` | **P2 补强**：同问秒回（1h TTL），缓存 key 区分检索模式（D15） |
 | 置信度评分 | `confidence.py` | **P2 补强**：检索分+引用+拒答占比算可信度，前端徽章展示（D16） |
 | 跨模态 | `multimodal.py` | **P2 补强**：表格/图片(OCR) 结构化入库，统一走一套检索（D17） |
+| 答案质检 | `schema_qc.py` | **对标 GEOFlow 质量门禁**：答案质检强制 JSON Schema 输出 + 证据编号回验，替代拒答正则（详见下节） |
 
 **技术选型理由（面试常问）**
 - `sentence-transformers` 的 `bge-small-zh-v1.5`：中文语义检索效果好的轻量模型，本地跑不联网也能检索。
@@ -229,7 +230,64 @@ curl "http://127.0.0.1:5000/api/cache?token=$TK"
 curl -X DELETE "http://127.0.0.1:5000/api/cache?token=$TK&namespace=demo"
 ```
 
-**前端体验**：打字机流式输出、置信度徽章（high/medium/low）、缓存命中标记、检索模式切换（默认/图谱）、跨模态来源卡片。
+**前端体验**：打字机流式输出、置信度徽章（high/medium/low）、**质检徽章（有据可答/部分有据/资料未提及/无依据·疑似幻觉）**、缓存命中标记、检索模式切换（默认/图谱）、跨模态来源卡片。
+
+### 答案质检：JSON Schema 硬约束（借鉴 GEOFlow 质量门禁，2026-08-31）
+
+> 改造前，「这个答案可不可信」全靠 `confidence.py` 里的**中文正则**猜：
+> `_REFUSE_RE = re.compile(r"资料里没提到|没有检索到|我不了解|无法确定|没有找到")`
+> 三个硬伤：**换个说法就漏判**、**英文场景直接瞎**（D17 做了多语言，拒答检测却只有中文词表）、
+> **引用从不校验**（模型编一个 `[3]`，实际只召回 2 段，照样高分通过）。
+
+**做法**：让模型自己结构化呈堂证供，再用 schema 硬性校验（GEOFlow 的 `ArticleQualityReviewerAgent`
+同款思路）。
+
+```json
+{
+  "status": "answered|partial|refused|unsupported",
+  "confidence": 0.0,
+  "claims": [
+    {"text": "年假有5天", "evidence_keys": [1], "evidence_status": "supported|weak|unsupported"}
+  ],
+  "missing": "资料里缺少什么",
+  "reasons": ["判定理由"]
+}
+```
+
+**三道硬校验**（不靠模型自觉，`schema_qc.validate_qc`）：
+
+| 层 | 检查什么 | 失败后果 |
+|---|---|---|
+| ① schema | required / 类型 / status 四态枚举 / confidence 值域 | 记 errors，尽力修复后继续 |
+| ② 证据回验 | `evidence_keys` 超出实际召回数 → 强制 `unsupported` 并剔除越界编号 | **抓引用幻觉** |
+| ③ 一致性 | `status=answered` 但无一条 `supported` → 降级 `unsupported` | 抓自相矛盾 |
+
+**置信度融合**（`confidence.score_confidence(..., qc=qc)`）：拿到结构化台账后，落地性
+（groundedness）改由**证据比例**算（supported 计 1、weak 计 0.5），不再猜拒答；并按 status
+设天花板：`refused ≤ 0.15`、`unsupported ≤ 0.30`、`partial ≤ 0.60`。模型自评占三成权重。
+
+**兜底原则**：解析失败 / 校验失败 / 调用失败 → 一律回退正则启发式，并标
+`mode=heuristic_fallback`，**保证不比改造前更差**。回退模式下评分逻辑完全不变（自测已锁回归）。
+
+**实测对比**（真实 DeepSeek 调用，同一答案）：
+
+| 场景 | 旧（拒答正则） | 新（JSON Schema 质检） |
+|---|---|---|
+| 「公司提供住房补贴吗？」<br>答：*资料里没提到住房补贴。不过《报销标准表》里提到住宿报销上限是500元/晚 [2]。* | **low 0.15**<br>首句含「资料里没提到」→ 整段判拒答<br>（实际拒答只占 22% 篇幅） | **medium 0.60**<br>3 条断言：2 有据 + 1 无据 → partial<br>并给出「资料缺口：未明确提及住房补贴」 |
+| 英文提问（正则的死穴） | 中文词表匹配不到，拒答检测失效 | 正常判 `answered`，理由为英文 |
+
+**开关**：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `RAG_QC_MODE` | `json` | `off` = 完全关闭退回纯启发式（省一次调用） |
+| `RAG_QC_ACTION` | `warn` | `block` = `unsupported` 答案就地拦截，换成拒答话术（对齐 GEOFlow「不合格留草稿」） |
+
+**成本优化**：`hits=0`（没召回任何资料）直接短路判拒答，不浪费质检调用；流式场景质检在
+打字机结束后再跑，不挡首字延迟。
+
+**自测**：`python test_schema_qc.py`（41 项离线断言，无需 API Key），覆盖六种「模型不乖」的
+输出形态、三层校验、置信度融合与回归、回退分支、门禁动作。
 
 **启用鉴权**
 ```bash
@@ -243,9 +301,10 @@ $PY app.py
 
 ## 八、已知边界 / 下一步可扩展（P2 已收）
 
-- ✅ **P0 + P1 + P2 全收敛**：Rerank / 表格抽取 / 模型可配置 / 鉴权+ACL / 量化评测（P0）；GraphRAG / Agentic RAG / 连接器 / 多轮上下文 / LLMOps / 持久化向量库（P1）；语义分块 / 上下文压缩 / 流式+缓存 / 置信度评分 / 多语言跨模态（P2）均已落地并实测。
+- ✅ **P0 + P1 + P2 全收敛**：Rerank / 表格抽取 / 模型可配置 / 鉴权+ACL / 量化评测（P0）；GraphRAG / Agentic RAG / 连接器 / 多轮上下文 / LLMOps / 持久化向量库（P1）；语义分块 / 上下文压缩 / 流式+缓存 / 置信度评分 / 多语言跨模态（P2）均已落地并实测。另补 **JSON Schema 硬约束质检**（对标 GEOFlow 质量门禁）。
 - ⚠️ 当前 ACL 是「应用层 token + namespace 白名单」，企业级应**镜像源系统 ACL**（Glean / M365 Purview 那种），数据模型已留扩展位（namespace 即隔离边界）。
 - ⚠️ OCR 需另装 `pytesseract` + 系统 `Tesseract` + `poppler`，未装时扫描件仅提示、不阻断入库。
 - ⚠️ 大文件（>50MB PDF）解析较慢，可加「后台任务 + 进度条」。
-- 💡 **P2 待办（体验层）**：语义/命题分块（D13）、上下文压缩去重（D14）、流式响应 + 答案置信度评分（D15/D16）、多语言/跨模态（D17）；以及把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现。
+- ✅ **额外补强**：答案质检改 JSON Schema 硬约束（`schema_qc.py`），借鉴 GEOFlow 质量门禁——替代拒答正则、抓引用幻觉、给出资料缺口。
+- 💡 **下一步可做**：把 Qdrant / Langfuse 当成可选后端替换 `vector_store` / `rag_log` 的轻量实现；知识库加时效(`effective_date`)/审核状态并在召回前过滤（GEOFlow 同款）；引用块加 `content_hash` 发布时回验。
 - 💡 可接 day22 的 `xhs-cover-gen` 思路，把「知识库问答」包装成可被外部调用的服务。

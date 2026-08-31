@@ -33,6 +33,7 @@ import connectors as conn_mod
 import multimodal as mm_mod
 import cache as cache_mod
 import confidence as conf_score_mod
+import schema_qc as qc_mod
 
 # 启动即加载 .env（和 agent.py 同一份），确保换 key 立刻生效
 _load_env()
@@ -168,6 +169,9 @@ def ask():
         "confidence": out.get("confidence"),
         "confidence_level": out.get("confidence_level"),
         "confidence_reason": out.get("confidence_reason"),
+        # JSON Schema 硬约束质检（schema_qc，借鉴 GEOFlow 质量门禁）
+        "qc": out.get("qc"),
+        "qc_action": out.get("qc_action", "warn"),
         # D14 上下文压缩 / D15 缓存
         "compress": out.get("compress"),
         "from_cache": bool(out.get("from_cache")),
@@ -211,6 +215,17 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
                     conf = conf_score_mod.score_confidence(
                         [(s, {}) for s in prepared.get("scores", [])], answer,
                         threshold=rc.RELEVANCE_THRESHOLD)
+                    # JSON Schema 硬约束质检：流式打印结束后再判，不挡打字机体验
+                    qc = qc_mod.run_qc(prepared["effective_question"], answer,
+                                       prepared["sources"], hits=prepared["hits"],
+                                       level=conf["level"])
+                    qc_action = "warn"
+                    if qc and (qc.get("mode", "") or "").startswith("json"):
+                        conf = conf_score_mod.score_confidence(
+                            [(s, {}) for s in prepared.get("scores", [])], answer,
+                            threshold=rc.RELEVANCE_THRESHOLD, qc=qc)
+                        # block 模式：无依据答案就地拦截（前端收到后整体替换显示）
+                        answer, qc_action = qc_mod.apply_action(qc, answer)
                     try:
                         cache_mod.cache_set(prepared["namespace"],
                                             prepared["effective_question"],
@@ -226,6 +241,8 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
                                                 "confidence_level": conf["level"],
                                                 "confidence_reason": conf["reason"],
                                                 "confidence_factors": conf["factors"],
+                                                "qc": qc,
+                                                "qc_action": qc_action,
                                             })
                     except Exception:
                         pass
@@ -239,6 +256,7 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
                            "confidence_level": conf["level"],
                            "confidence_reason": conf["reason"],
                            "confidence_factors": conf["factors"],
+                           "qc": qc, "qc_action": qc_action,
                            "compress": prepared["compress"],
                            "from_cache": False}
         except ValueError as e:
@@ -271,6 +289,8 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
             "confidence": out.get("confidence"),
             "confidence_level": out.get("confidence_level"),
             "confidence_reason": out.get("confidence_reason"),
+            "qc": out.get("qc"),
+            "qc_action": out.get("qc_action", "warn"),
             "compress": out.get("compress"),
             "from_cache": bool(out.get("from_cache")),
         })
@@ -394,5 +414,5 @@ def stats():
 
 
 if __name__ == "__main__":
-    # debug=False 生产更稳；端口 5000 是 Flask 默认，方便记忆
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # debug=False 生产更稳；端口默认 5000，可用 $env:PORT=5001 覆盖（5000 被占时绕开）
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5000)), debug=False)

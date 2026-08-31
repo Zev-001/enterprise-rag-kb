@@ -299,6 +299,30 @@
 14. **D17 多语言/跨模态**：✅ 表格/图片(OCR) 结构化入库 + 「用提问语言回答」提示词。
 15. **README 成长叙事**：✅ A/B/C 成果全部写进 `README.md` 的"对标高端系统的升级记录"。
 
+### 阶段 D —— 对标 GEOFlow 质量门禁（**已完成 ✅ 2026-08-31**）
+
+> 拆解开源项目 [GEOFlow](https://github.com/yaojingang/GEOFlow)（企业级 GEO 智能运营系统，PHP/Laravel + pgvector）后，
+> 把它的 **AI 质量门禁**思想搬进 RAG：质检结果强制 JSON Schema、证据编号回验、发布前置拦截。
+> 详见 `AI转行计划/geoflow_learn/GEOFlow拆解学习笔记.md`。
+
+16. **D18 质检输出 JSON Schema 硬约束**：✅ 新增 `schema_qc.py`。
+
+    - **改造前**：拒答判定靠中文正则 `_REFUSE_RE`（换说法漏判 / 英文失效 / 引用从不校验）。
+    - **改造后**：模型输出 `{status, confidence, claims[{text, evidence_keys, evidence_status}], missing, reasons}`，
+      经三层校验（schema 类型枚举 → **证据编号越界回验** → answered/unsupported 一致性）。
+    - **置信度融合**：落地性改由证据比例算（supported=1、weak=0.5），status 设天花板
+      （refused ≤0.15 / unsupported ≤0.30 / partial ≤0.60），模型自评占三成权重。
+    - **兜底**：解析/校验/调用任一失败 → 回退正则启发式并标 `mode=heuristic_fallback`，**不比改造前差**。
+    - **门禁动作**：`RAG_QC_ACTION=block` 时拦截 `unsupported` 答案（对齐 GEOFlow「不合格留草稿」）。
+    - **实测**：问「公司提供住房补贴吗？」——旧正则因首句「资料里没提到」整段判 low 0.15（拒答实占 22% 篇幅），
+      新质检逐条判出「2 有据 + 1 无据」→ medium 0.60 并给出资料缺口；英文提问场景正则完全失效、质检正常。
+    - **自测**：`test_schema_qc.py` 41 项断言全过（离线，无需 API Key）；`_p2_selftest.py` 35 项、`eval_rag.py` 召回 100% 均无回归。
+
+**仍可继续对标 GEOFlow 的方向（未做）**：
+  - 引用块加 `content_hash`，发布时回验引用是否还在（GEOFlow `validateEvidenceSnapshot`）；
+  - 知识库加 `effective_date`（时效）+ `review_status`（审核态），召回前过滤；
+  - 内容指纹（内容+prompt+知识 hash）替代问题级缓存 key，实现"知识变了自动失效"。
+
 > **给面试官的话术**："我没有盲目堆功能，而是先调研了 Glean/百炼/RAGFlow 的 2026 基线，逐条对照自家代码找出 P0/P1/P2 缺口，按'先补企业级底线、再上差异化'的顺序迭代——这份 `RAG调研与缺陷分析.md` 就是我的需求文档。"
 
 ---
