@@ -318,10 +318,26 @@
       新质检逐条判出「2 有据 + 1 无据」→ medium 0.60 并给出资料缺口；英文提问场景正则完全失效、质检正常。
     - **自测**：`test_schema_qc.py` 41 项断言全过（离线，无需 API Key）；`_p2_selftest.py` 35 项、`eval_rag.py` 召回 100% 均无回归。
 
+17. **D19 引用内容级回验**：✅ 新增 `evidence_verify.py`（2026-08-31）。
+
+    - **抓什么**：编号越界校验抓不到的「张冠李戴」——答案说「年假有 5 天 [2]」而 [2] 是报销块，
+      编号合法、LLM 质检员也可能看走眼（对标 GEOFlow `validateEvidenceSnapshot`）。
+    - **三层评分**：归一化子串精确命中 → 字符 bigram containment（零依赖兜底）→
+      bge 向量余弦（复用检索模型，离线加载，不依赖运行时网络）。
+    - **双信号判据**（实测校准：相关对 cos≈0.73 / 张冠李戴对 cos≈0.50 / 无关 <0.40；
+      bge 对短句 vs 长块分数虚高，单看绝对线会误判）：cos ≥0.62 或 ngram ≥0.35 → supported；
+      cos ≥0.42 或 ngram ≥0.15 → weak；否则 unsupported。
+    - **只降不升**：回验只能把 LLM 判的证据状态往下修，绝不往上修；修正写入 reasons 与
+      verification 明细并重算 summary（置信度融合自动吃到新比例）。
+    - **实测**：人为把「年假有5天」的引用换到报销块 → 降为 weak（0.483）并写明理由；
+      正常引用（exact 1.0）不受影响。
+    - **自测**：`test_evidence_verify.py` 33 项全过（含真实语义路径）；
+      P2 35/35、D18 41/41、eval 检索层 100 分均无回归。
+
 **仍可继续对标 GEOFlow 的方向（未做）**：
-  - 引用块加 `content_hash`，发布时回验引用是否还在（GEOFlow `validateEvidenceSnapshot`）；
   - 知识库加 `effective_date`（时效）+ `review_status`（审核态），召回前过滤；
-  - 内容指纹（内容+prompt+知识 hash）替代问题级缓存 key，实现"知识变了自动失效"。
+  - 内容指纹（内容+prompt+知识 hash）替代问题级缓存 key，实现"知识变了自动失效"
+    （`evidence_verify.content_hash` 已就位，可直接复用）。
 
 > **给面试官的话术**："我没有盲目堆功能，而是先调研了 Glean/百炼/RAGFlow 的 2026 基线，逐条对照自家代码找出 P0/P1/P2 缺口，按'先补企业级底线、再上差异化'的顺序迭代——这份 `RAG调研与缺陷分析.md` 就是我的需求文档。"
 

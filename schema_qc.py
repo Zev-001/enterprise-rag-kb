@@ -419,6 +419,15 @@ def run_qc(question, answer, sources, hits=0, level=None, verbose=False):
         return q
 
     qc["mode"] = "json" if not errors else "json_repaired"
+
+    # D19：引用内容级回验（张冠李戴检测）——拿引用块全文校验每条断言，
+    # 只降不升。失败/关闭时原样返回，不伤主流程。
+    try:
+        import evidence_verify
+        qc, _ = evidence_verify.reverify(qc, sources, verbose=verbose)
+    except Exception:
+        pass
+
     qc["summary"] = summarize(qc)
     if verbose:
         print("🧪 质检：status={0} conf={1} claims={2}（{3}）".format(

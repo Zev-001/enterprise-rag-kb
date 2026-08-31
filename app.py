@@ -158,7 +158,7 @@ def ask():
     return jsonify({
         "ok": True,
         "answer": out["answer"],
-        "sources": out["sources"],
+        "sources": _public_sources(out["sources"]),
         "backend": out["backend"],
         "hits": out["hits"],
         "session_id": session_id,
@@ -181,6 +181,21 @@ def ask():
 def _sse(obj):
     """SSE 帧：data: {json}\n\n"""
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+def _public_sources(sources):
+    """API 出口过滤：剥掉 sources 里的全文 text 字段（D19 回验内部用，不外发）。
+
+    前端只需要 n/title/score/snippet/modality；全文可能几 KB/块，不该出网。
+    """
+    if not sources:
+        return sources
+    out = []
+    for s in sources:
+        if isinstance(s, dict):
+            s = {k: v for k, v in s.items() if k != "text"}
+        out.append(s)
+    return out
 
 
 def _ask_stream(question, namespace="default", mode="default", retrieval="default",
@@ -282,7 +297,7 @@ def _ask_stream(question, namespace="default", mode="default", retrieval="defaul
         sess_mod.append(session_id, question, answer, out.get("sources"), namespace)
         yield _sse({
             "type": "done", "ok": True, "answer": answer,
-            "sources": out.get("sources"), "backend": out.get("backend"),
+            "sources": _public_sources(out.get("sources")), "backend": out.get("backend"),
             "hits": out.get("hits"), "session_id": session_id,
             "mode": mode if mode != "default" else retrieval,
             "effective_question": out.get("effective_question"),

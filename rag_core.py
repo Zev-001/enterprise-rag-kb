@@ -578,6 +578,7 @@ def prepare_ask(question, top_k=DEFAULT_TOP_K, namespace="default",
     sources = [
         {"n": i + 1, "filename": r.get("filename", ""), "title": r.get("title", ""),
          "score": round(s, 3), "snippet": r["text"][:200],
+         "text": r["text"],  # D19：全文，供引用内容回验（snippet 200 字会截断依据）
          "modality": r.get("modality", "text")}
         for i, (s, r) in enumerate(pairs)]
 

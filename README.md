@@ -51,6 +51,7 @@
 | 置信度评分 | `confidence.py` | **P2 补强**：检索分+引用+拒答占比算可信度，前端徽章展示（D16） |
 | 跨模态 | `multimodal.py` | **P2 补强**：表格/图片(OCR) 结构化入库，统一走一套检索（D17） |
 | 答案质检 | `schema_qc.py` | **对标 GEOFlow 质量门禁**：答案质检强制 JSON Schema 输出 + 证据编号回验，替代拒答正则（详见下节） |
+| 引用内容回验 | `evidence_verify.py` | **对标 GEOFlow validateEvidenceSnapshot**：拿引用块全文校验每条断言，抓「张冠李戴」型引用幻觉，只降不升（D19，详见下节） |
 
 **技术选型理由（面试常问）**
 - `sentence-transformers` 的 `bge-small-zh-v1.5`：中文语义检索效果好的轻量模型，本地跑不联网也能检索。
@@ -288,6 +289,26 @@ curl -X DELETE "http://127.0.0.1:5000/api/cache?token=$TK&namespace=demo"
 
 **自测**：`python test_schema_qc.py`（41 项离线断言，无需 API Key），覆盖六种「模型不乖」的
 输出形态、三层校验、置信度融合与回归、回退分支、门禁动作。
+
+### 引用内容级回验：抓「张冠李戴」（借鉴 GEOFlow validateEvidenceSnapshot，2026-08-31）
+
+D18 的编号越界校验抓不到这种幻觉：答案说「年假有 5 天 [2]」，而 [2] 那块讲的是报销——
+编号合法、LLM 质检员也可能看走眼。`evidence_verify.py` 在质检后追加**内容级回验**：
+
+1. 对每条 claim，拿它引用块的**全文**（snippet 200 字会截断依据，`prepare_ask` 已补全文字段）
+   做相似度校验，三层评分：归一化子串精确命中 → 字符 bigram 重叠（零依赖兜底）→
+   bge 向量余弦（复用检索模型，`HF_HUB_OFFLINE=1` 离线加载，不依赖运行时网络）；
+2. **双信号判据**（按实测校准：相关对 cos≈0.73 / 张冠李戴对 cos≈0.50 / 无关 <0.40，
+   bge 对「短句 vs 长块」分数虚高，单看绝对线会误判）：cos ≥0.62 或 n-gram ≥0.35 →
+   supported；cos ≥0.42 或 n-gram ≥0.15 → weak；否则 unsupported；
+3. **只降不升**：回验只能把 LLM 判的 supported→weak→unsupported 往下修，绝不往上修——
+   宁可错杀为 weak，不把幻觉洗白；修正写入 `reasons` 与 `verification` 明细，
+   并重算 `summary`（置信度融合自动吃到新证据比例）。
+
+**实测**（真实 DeepSeek 调用）：把「年假有5天」的引用人为换到报销块 → 回验判
+`weak（score=0.483）` 并写明「依据偏弱」；正常引用（exact 1.0）不受影响。
+回归：`test_evidence_verify.py` 33 项（含真实语义路径）、P2 自测 35/35、D18 自测 41/41、
+eval 检索层 100 分。开关：`RAG_EVIDENCE_VERIFY=off` 关闭（默认 on，异常自动跳过不伤主流程）。
 
 **启用鉴权**
 ```bash
